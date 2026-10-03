@@ -19,13 +19,6 @@ import torch
 from vllm.config import set_current_vllm_config
 from vllm.model_executor.layers.linear import RowParallelLinear
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
-
-try:
-    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-        maybe_post_process_fp8_weight_block,
-    )
-except Exception:
-    print("No maybe_post_process_fp8_weight_block found, please check your vLLM version.")
 from vllm.utils.deep_gemm import per_block_cast_to_fp8
 from vllm.version import __version__ as vllm_version
 
@@ -35,14 +28,17 @@ from collector.vllm.utils_xpu import create_vllm_config, setup_distributed, with
 
 FP8_BLOCK_SHAPE = (128, 128)
 
-# Max device-memory fraction for the packed op copies.
-_LOOP_MEM_BUDGET_FRACTION = 0.45
+# Max device-memory fraction for packed op copies.
+_LOOP_MEM_BUDGET_FRACTION_BY_SYSTEM = {
+    "b60": 0.45,
+    "cri": 0.20,
+}
 
-# Upper bound on GEMM ops packed into one measurement graph. Small GEMMs are
-# launch/replay-overhead dominated, so packing more per graph amortizes it and
-# stabilizes the per-op latency (total/count). The memory budget drops this
-# lower for large shapes. Was 6 (CUDA-inherited); raised to cut small-shape jitter.
-_MAX_OPS_PER_GRAPH = 64
+# Max GEMMs packed into one graph, tuned per system.
+_MAX_OPS_PER_GRAPH_BY_SYSTEM = {
+    "b60": 64,
+    "cri": 80,
+}
 
 # Opt-in cross-process lock (default off): set AIC_TODEV_LOCK=<path> to serialize
 # host->device weight materialization if concurrent first-touch wedges a worker
@@ -110,8 +106,17 @@ def _gemm_peak_footprint_bytes(gemm_type: str, m: int, n: int, k: int, copies: i
     return footprint
 
 
+# Native GEMM formats per system, keyed by the --gpu name (via COLLECTOR_SYSTEM).
+# Unknown/unset systems fall back to the full YAML gemm_types list.
+_GEMM_TYPES_BY_SYSTEM = {
+    "b60": ["bfloat16", "fp8"],
+    "cri": ["bfloat16", "fp8", "fp8_block", "mxfp4", "mxfp8"],
+}
+
+
 def get_gemm_test_cases():
-    gemm_list = get_gemm_type_specs("vllm_xpu")
+    system = os.environ.get("COLLECTOR_SYSTEM") or None
+    gemm_list = _GEMM_TYPES_BY_SYSTEM.get(system) or get_gemm_type_specs("vllm_xpu")
     if not gemm_list:
         raise RuntimeError("collector/cases/base_ops/gemm.yaml must define vllm_xpu gemm_types")
 
@@ -125,6 +130,18 @@ def get_gemm_test_cases():
             test_cases.append([gemm_type, x, n, k])
 
     return test_cases
+
+
+def _get_loop_mem_budget_fraction() -> float:
+    system = os.environ.get("COLLECTOR_SYSTEM") or None
+    return _LOOP_MEM_BUDGET_FRACTION_BY_SYSTEM.get(
+        system, _LOOP_MEM_BUDGET_FRACTION_BY_SYSTEM["b60"]
+    )
+
+
+def _get_max_ops_per_graph() -> int:
+    system = os.environ.get("COLLECTOR_SYSTEM") or None
+    return _MAX_OPS_PER_GRAPH_BY_SYSTEM.get(system, _MAX_OPS_PER_GRAPH_BY_SYSTEM["b60"])
 
 
 @with_exit_stack
@@ -153,6 +170,12 @@ def run_gemm(exit_stack, gemm_type, m, n, k, *, perf_filename, device="xpu:0"):
             activation_scheme="dynamic",
             weight_block_size=list(FP8_BLOCK_SHAPE),
         )
+    elif gemm_type in ("mxfp4", "mxfp8"):
+        # MXFP4/MXFP8 dense-linear only exists on vLLM's "online" path.
+        from vllm.config.quantization import resolve_quantization_config
+        from vllm.model_executor.layers.quantization.online.base import OnlineQuantizationConfig
+
+        qc = OnlineQuantizationConfig(resolve_quantization_config(gemm_type, None))
     else:
         qc = None
 
@@ -183,8 +206,8 @@ def run_gemm(exit_stack, gemm_type, m, n, k, *, perf_filename, device="xpu:0"):
                         else:
                             param.zero_()
 
-            if gemm_type == "fp8" and hasattr(gemm, "weight"):
-                # Use process_weights_after_loading() to quantize the weights after creation
+            if gemm_type in ("fp8", "mxfp4", "mxfp8") and hasattr(gemm, "weight"):
+                # Quantize the weights in place after creation.
                 if hasattr(gemm, "quant_method") and gemm.quant_method is not None:
                     quant_method = gemm.quant_method
                     if hasattr(quant_method, "process_weights_after_loading"):
@@ -203,12 +226,11 @@ def run_gemm(exit_stack, gemm_type, m, n, k, *, perf_filename, device="xpu:0"):
                         if not hasattr(gemm, "weight_scale"):
                             gemm.weight_scale = gemm.weight_scale_inv
 
-                    # Support both old (layer-only) and new (layer, cutlass_supported)
-                    # signatures for maybe_post_process_fp8_weight_block.
-                    try:
-                        maybe_post_process_fp8_weight_block(gemm)
-                    except TypeError:
-                        maybe_post_process_fp8_weight_block(gemm, cutlass_block_fp8_supported=True)
+                # Finalize block weights via the layer's own quant method.
+                if hasattr(gemm, "quant_method") and gemm.quant_method is not None:
+                    quant_method = gemm.quant_method
+                    if hasattr(quant_method, "process_weights_after_loading"):
+                        quant_method.process_weights_after_loading(gemm)
 
             gemm.forward(x)  # noqa: F821  # dry run to init
 
@@ -225,9 +247,9 @@ def run_gemm(exit_stack, gemm_type, m, n, k, *, perf_filename, device="xpu:0"):
     total_mem = get_device_module().get_device_properties(device).total_memory
     per_copy = (n * k + m * n) * 2
     fixed_bytes = _gemm_peak_footprint_bytes(gemm_type, m, n, k, copies=0)
-    budget = int(total_mem * _LOOP_MEM_BUDGET_FRACTION)
+    budget = int(total_mem * _get_loop_mem_budget_fraction())
     mem_cap = (budget - fixed_bytes) // max(per_copy, 1)
-    outside_loop_count = max(1, min(_MAX_OPS_PER_GRAPH, mem_cap))
+    outside_loop_count = max(1, min(_get_max_ops_per_graph(), mem_cap))
 
     op_list = []
     try:

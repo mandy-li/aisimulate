@@ -1667,23 +1667,46 @@ def _get_base_gemm_shape_sweeps(backend: str | None = None) -> list[dict[str, ob
 def get_gemm_case_specs(backend: str | None = None) -> list[GemmCommonTestCase]:
     test_cases = []
     base_token_counts: set[int] = set()
+    include_model_case_values = True
     for shape_sweep in _get_base_gemm_shape_sweeps(backend):
+        if shape_sweep.get("include_model_case_values") is False:
+            include_model_case_values = False
         token_counts = _as_int_list(shape_sweep.get("token_counts"), field_name="gemm.token_counts")
         base_token_counts.update(token_counts)
-        feature_sizes = shape_sweep.get("feature_sizes")
-        input_feature_sizes = _as_int_list(
-            shape_sweep.get("input_feature_sizes", feature_sizes),
-            field_name="gemm.input_feature_sizes",
-        )
-        output_feature_sizes = _as_int_list(
-            shape_sweep.get("output_feature_sizes", feature_sizes),
-            field_name="gemm.output_feature_sizes",
-        )
+        exact_feature_pairs = shape_sweep.get("feature_pairs")
+        if exact_feature_pairs is not None:
+            if not isinstance(exact_feature_pairs, list):
+                raise TypeError("gemm.feature_pairs must be a list")
+            feature_pairs = []
+            for index, pair in enumerate(exact_feature_pairs):
+                if not isinstance(pair, dict):
+                    raise TypeError(f"gemm.feature_pairs[{index}] must be a mapping")
+                output_features = int(pair["output_features"])
+                input_features = int(pair["input_features"])
+                feature_pairs.append((output_features, input_features))
+        else:
+            feature_sizes = shape_sweep.get("feature_sizes")
+            input_feature_sizes = _as_int_list(
+                shape_sweep.get("input_feature_sizes", feature_sizes),
+                field_name="gemm.input_feature_sizes",
+            )
+            output_feature_sizes = _as_int_list(
+                shape_sweep.get("output_feature_sizes", feature_sizes),
+                field_name="gemm.output_feature_sizes",
+            )
         skip_shapes = {
             (int(skip["output_features"]), int(skip["input_features"])) for skip in shape_sweep.get("skip_shapes", [])
         }
 
         for token_count in sorted(token_counts, reverse=True):
+            if exact_feature_pairs is not None:
+                for output_features, input_features in feature_pairs:
+                    if (output_features, input_features) in skip_shapes:
+                        continue
+                    if output_features * input_features == 65536 * 65536:
+                        continue
+                    test_cases.append(GemmCommonTestCase(x=token_count, n=output_features, k=input_features))
+                continue
             for output_features in sorted(output_feature_sizes, reverse=True):
                 for input_features in sorted(input_feature_sizes, reverse=True):
                     if (output_features, input_features) in skip_shapes:
@@ -1691,6 +1714,9 @@ def get_gemm_case_specs(backend: str | None = None) -> list[GemmCommonTestCase]:
                     if output_features * input_features == 65536 * 65536:
                         continue
                     test_cases.append(GemmCommonTestCase(x=token_count, n=output_features, k=input_features))
+
+    if not include_model_case_values:
+        return test_cases
 
     # Model-declared exact widths (model_case_values.gemm), e.g. scalar expert
     # gates and GDN b/a projections below the base feature grid. Token density

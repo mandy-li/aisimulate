@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Intel "Crescent Island" (CRI) inference GPU, Xe3P. 160GB reference SKU.
+# torch.xpu.get_device_name(0): "Intel(R) Graphics [0x674f]".
+
+data_dir: data/cri # relative to systems_dir
+gpu:
+  mem_bw: 1500000000000 # 1.5 TB/s LPDDR5X
+  mem_bw_empirical_scaling_factor: 0.5 # TODO(cri): re-measure on CRI
+  mem_empirical_constant_latency: 0.000003 # TODO(cri): re-measure on CRI (3us)
+  mem_capacity: 171786108928 # 160GiB LPDDR5X
+  float32_tc_flops: 20500000000000 # 20.5 TFLOPS (FP64: 10.2 TFLOPS)
+  bfloat16_tc_flops: 655500000000000 # est: 1/2 FP8
+  int8_tc_flops: 1311000000000000 # est: = FP8
+  fp8_tc_flops: 1311000000000000 # 1311 TFLOPS native (MXFP4: 2622 TFLOPS)
+  power: 350 # 350W TDP
+
+node:
+  num_gpus_per_node: 8
+  inter_node_bw: 50000000000 # TODO(cri): NIC-dependent, Byte/s per GPU, single direction
+  intra_node_bw: 56000000000 # PCIe Gen5 x16 peer, Byte/s per GPU, single direction
+  pcie_bw: 64000000000 # PCIe Gen5 x16, Byte/s, single direction
+  p2p_latency: 0.000002 # TODO(cri): re-measure on CRI (2us)
+
+misc:
+  nccl_mem: # TODO(cri): re-measure with oneccl
+    1: 0
+    2: 358612992
+    4: 411041792
+    8: 411041792
+  other_mem: 524288000 # 500MiB runtime reserve
+  nccl_version: '2.23' # TODO(cri)
+  oneccl_version: '2022.0.0' # TODO(cri)

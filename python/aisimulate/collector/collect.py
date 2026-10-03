@@ -2358,6 +2358,11 @@ def collect_vllm(
         logger.exception("vLLM is not installed. Please install it from https://github.com/vllm-project/vllm")
         return None, None
 
+    # The Intel XPU (b60/cri) vLLM wheel reports a setuptools-scm dev build
+    # (e.g. "0.1.dev1+geb38eaa1e.d20260921") that does not map to a collector
+    # release, a version-routed module, or a data path. Hard-pin it to 0.28.0.
+    version = "0.28.0"
+
     from collector.framework_manifest import require_collector_runtime
 
     requested_ops = set(ops if ops is not None else (case_plan.ops if case_plan is not None else []))
@@ -6056,6 +6061,10 @@ def main():
         logger.info(f"Starting collection with {num_processes} GPU processes")
 
     # Set environment variables for worker processes
+    # Thread the target system name (from --gpu) to workers so collectors can
+    # select per-system cases (e.g. GEMM dtypes differ between b60 and cri).
+    if args.gpu:
+        os.environ["COLLECTOR_SYSTEM"] = args.gpu
     if args.measure_power:
         os.environ["COLLECTOR_MEASURE_POWER"] = "true"
         os.environ["COLLECTOR_POWER_MIN_DURATION"] = str(args.power_test_duration_sec)
