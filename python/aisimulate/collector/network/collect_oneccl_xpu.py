@@ -34,6 +34,7 @@ OP_NAME_TO_BIN = {
     "all_gather": "allgather_perf",
     "reduce_scatter": "reduce_scatter_perf",
     "all_reduce": "allreduce_perf",
+    "alltoall": "alltoall_perf",
 }
 
 DTYPE_TO_CCL = {
@@ -45,6 +46,22 @@ BYTES_PER_ELEMENT = {
     "half": 2,
     "int8": 1,
 }
+
+
+def _mpirun_root_args():
+    """Open MPI refuses to launch as root without --allow-run-as-root; Intel MPI
+    (Hydra, used on B60) does not recognize the flag. Add it only for Open MPI
+    (used on CRI) running as root."""
+    try:
+        if os.geteuid() != 0:
+            return []
+    except AttributeError:
+        return []
+    try:
+        out = subprocess.run(["mpirun", "--version"], capture_output=True, text=True).stdout
+    except Exception:
+        return []
+    return ["--allow-run-as-root"] if "Open MPI" in out else []
 
 
 def find_benchmark_binary(oneccl_op: str):
@@ -63,7 +80,7 @@ def find_benchmark_binary(oneccl_op: str):
 
 
 def get_oneccl_version():
-    """Get installed oneCCL version string (pip wheel, else apt package)."""
+    """Get installed oneCCL version string (pip wheel, apt package, else system header)."""
     try:
         import importlib.metadata as im
 
@@ -80,6 +97,22 @@ def get_oneccl_version():
             return result.stdout.strip()
     except Exception:
         pass
+    # System install (e.g. CRI /opt/gfx-deps/oneccl): no pip/apt package exists,
+    # so read the version macros straight from the installed oneCCL header.
+    for root in (os.environ.get("ONECCL_ROOT"), os.environ.get("CCL_ROOT"), "/opt/gfx-deps/oneccl"):
+        if not root:
+            continue
+        config_h = os.path.join(root, "include", "oneapi", "ccl", "config.h")
+        try:
+            with open(config_h) as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        major = re.search(r"CCL_MAJOR_VERSION\s+(\d+)", text)
+        minor = re.search(r"CCL_MINOR_VERSION\s+(\d+)", text)
+        update = re.search(r"CCL_UPDATE_VERSION\s+(\d+)", text)
+        if major and minor and update:
+            return f"{major.group(1)}.{minor.group(1)}.{update.group(1)}"
     return "unknown_version"
 
 
@@ -139,6 +172,7 @@ def oneccl_benchmark(
 
     cmd = [
         "mpirun",
+        *_mpirun_root_args(),
         "-n",
         str(num_gpus),
         benchmark_bin,
@@ -220,7 +254,7 @@ if __name__ == "__main__":
         "--oneccl_op",
         "-O",
         default="all_gather",
-        choices=["all_gather", "reduce_scatter", "all_reduce"],
+        choices=["all_gather", "reduce_scatter", "all_reduce", "alltoall"],
         help="oneCCL operation to benchmark",
     )
     parser.add_argument(

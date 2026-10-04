@@ -95,7 +95,9 @@ SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 if [[ "$device" == "cuda" ]]; then
     GPU_COUNT=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
 elif [[ "$device" == "xpu" ]]; then
-    GPU_COUNT=$(xpu-smi discovery 2>/dev/null | grep -c "Device Name:")
+    # Let torch report the available XPUs. It honors ZE_AFFINITY_MASK when set
+    # and, unlike xpu-smi, does not hang on CRI images.
+    GPU_COUNT=$(python3 -c "import torch; print(torch.xpu.device_count())")
 fi
 
 echo "Found $GPU_COUNT GPUs."
@@ -142,9 +144,7 @@ elif [[ "$device" == "xpu" ]]; then
         echo "Error: --measure_power is not yet supported for oneCCL XPU benchmarks"
         exit 1
     fi
-    # Note: alltoall hangs on oneCCL SYCL/GPU backend and is excluded.
-    # vLLM XPU uses allgather+reduce_scatter (AgRs) for MoE, not alltoall.
-    oneccl_ops=("all_gather" "reduce_scatter" "all_reduce")
+    oneccl_ops=("all_gather" "reduce_scatter" "all_reduce" "alltoall")
     dtypes=("half" "int8")
 
     for n in "${gpu_count_list[@]}"; do
