@@ -65,12 +65,14 @@ from collector.vllm.utils_xpu import (
 class MockAttentionLayer:
     """A mock attention layer for testing."""
 
-    def __init__(self, device: torch.device):
-        self._q_scale = torch.tensor(1.0, device=device)
+    def __init__(self, device: torch.device, q_scale: float = 1.0):
+        # A non-1.0 _q_scale selects the XPU kernel's static per-tensor FP8-Q
+        # path (maybe_quant_query Case 2 in xpu_attn.py); 1.0 leaves Q in bf16.
+        self._q_scale = torch.tensor(q_scale, device=device)
         self._k_scale = torch.tensor(1.0, device=device)
         self._v_scale = torch.tensor(1.0, device=device)
         # Add float versions for flashinfer
-        self._q_scale_float = 1.0
+        self._q_scale_float = q_scale
         self._k_scale_float = 1.0
         self._v_scale_float = 1.0
 
@@ -122,6 +124,7 @@ def run_attention_torch(
     is_context_phase,
     window_size=0,
     has_sink=False,
+    attn_dtype="bfloat16",
     *,
     perf_filename,
     device="xpu:0",
@@ -384,8 +387,14 @@ def run_attention_torch(
         sinks=sinks,
     )
 
-    # Create mock layer and output buffer
-    mock_layer = MockAttentionLayer(device)
+    # fp8 attn: set a static Q descale (amax/448) so the kernel quantizes the
+    # bf16 query to fp8 internally. Latency is scale-invariant.
+    if attn_dtype == "fp8":
+        amax = query_vllm.detach().abs().max().to(torch.float32)
+        q_scale = float((amax / 448.0).clamp(min=1e-4))
+        mock_layer = MockAttentionLayer(device, q_scale=q_scale)
+    else:
+        mock_layer = MockAttentionLayer(device)
     output = torch.empty_like(query_vllm)
 
     # Run forward pass
@@ -405,20 +414,32 @@ def run_attention_torch(
             backend_cls, impl, mock_layer, query_vllm, key_vllm, value_vllm, kv_cache, attn_metadata, output
         )
 
-    # Generation attention -> graph (matches decode serving); context/prefill -> eager
-    # (varlen path does a host copy, illegal under graph capture).
+    # Context: force chunk_prefill (is_mix_batch=False) and disable the
+    # spec-decode fast path, both of which else route to the paged decode kernel
+    # that is uncompiled for head_dim=256 at GQA ratio>8.
+    if is_context_phase:
+        import vllm._xpu_ops as _xpu_ops_mod
+        import vllm_xpu_kernels.flash_attn_interface as _fa_iface
+
+        _orig_varlen = _xpu_ops_mod.flash_attn_varlen_func
+
+        def _prefill_only_varlen(*args, **kwargs):
+            kwargs["is_mix_batch"] = False
+            return _orig_varlen(*args, **kwargs)
+
+        _xpu_ops_mod.flash_attn_varlen_func = _prefill_only_varlen
+        exit_stack.callback(setattr, _xpu_ops_mod, "flash_attn_varlen_func", _orig_varlen)
+
+        _orig_spec_qlen = _fa_iface._SPEC_DECODE_MAX_QLEN
+        _fa_iface._SPEC_DECODE_MAX_QLEN = 1
+        exit_stack.callback(setattr, _fa_iface, "_SPEC_DECODE_MAX_QLEN", _orig_spec_qlen)
+
+    # Generation -> graph (matches decode serving); context/prefill -> eager.
     use_graph = xpu_graph_measure_enabled() and not is_context_phase
 
-    # XPU graph replay launch (~38us) exceeds a tiny decode kernel, so a
-    # 1-op-per-graph measurement times CPU-launch idle gaps between replays
-    # (inflated + ~15% noisy). Pack N forwards per graph so one replay runs them
-    # back-to-back and the launch is amortized (same idea as the gemm collector).
-    # Repeating the forward is safe: do_kv_cache_update rewrites the same slots
-    # with the same K/V. N adapts to op size so big kernels (launch already
-    # negligible) stay at N=1. Graph/generation only.
-    # Dense-pack N forwards/graph to amortize XPU's ~38us replay launch on small
-    # decode kernels. Deterministic from shape (KV-bandwidth-bound) so pack_n is
-    # identical run-to-run; big kernels -> pack_n=1. Power-of-two.
+    # Pack N forwards per graph to amortize XPU's ~38us replay launch on small
+    # decode kernels. N is derived from KV bytes (deterministic), so big kernels
+    # stay at N=1. Graph/generation only.
     pack_n = 1
     if use_graph:
         kv_bytes = batch_size * input_len * num_kv_heads * head_dim * 2
@@ -452,7 +473,7 @@ def run_attention_torch(
         op_name = "generation_attention"
 
     kv_cache_dtype_str = "bfloat16" if not use_fp8_kv_cache else "fp8"
-    dtype_str = "bfloat16"
+    dtype_str = attn_dtype
     kernel_source = f"vllm_{backend_name_str}".lower()
 
     device_name = get_device_module().get_device_name(device)
@@ -505,6 +526,46 @@ def _kv_pool_fits(num_kv_heads, head_dim):
     return pool <= _device_total_memory() * _KV_POOL_MEM_FRACTION
 
 
+def _collector_system():
+    return os.environ.get("COLLECTOR_SYSTEM") or None
+
+
+def _attn_framework_key():
+    # CRI has its own YAML sweep (head_dim 256, wider GQA, fp8 Q). B60 and any
+    # unset system keep the shared vllm_xpu sweep.
+    return "vllm_xpu_cri" if _collector_system() == "cri" else "vllm_xpu"
+
+
+# XPU paged flash-attention GQA ratio ceiling, per system. CRI's newer vLLM-XPU
+# kernel supports a wider GQA ratio than B60 (customer needs 64 heads / 2 KV).
+_MAX_GQA_RATIO_BY_SYSTEM = {"b60": 16, "cri": 32}
+
+
+def _max_gqa_ratio():
+    return _MAX_GQA_RATIO_BY_SYSTEM.get(_collector_system(), 16)
+
+
+# (attn_compute_dtype, use_fp8_kv_cache) combos swept per system/phase. fp8 Q
+# compute on XPU requires an fp8 KV cache (the kernel couples them), so attn=fp8
+# only pairs with kv=fp8; attn=fp8/kv=bf16 is intentionally omitted. B60's kernel
+# is bf16-compute only. Generation is bf16 compute on every system.
+_ATTN_DTYPE_KV_COMBOS = {
+    ("cri", "context"): [("bfloat16", False), ("bfloat16", True), ("fp8", True)],
+    ("cri", "generation"): [("bfloat16", False), ("bfloat16", True)],
+}
+_DEFAULT_ATTN_DTYPE_KV_COMBOS = [("bfloat16", False), ("bfloat16", True)]
+
+
+def _attn_dtype_kv_combos(phase):
+    return _ATTN_DTYPE_KV_COMBOS.get((_collector_system(), phase), _DEFAULT_ATTN_DTYPE_KV_COMBOS)
+
+
+def _yaml_profiles_only():
+    # When set, drop the injected model-architecture topologies and sweep only
+    # the YAML head_profiles grid.
+    return os.environ.get("COLLECTOR_ATTN_YAML_ONLY", "").strip() not in ("", "0")
+
+
 def get_context_attention_test_cases(if_unit_test=False):
     test_cases = []
     _dropped_mem = 0
@@ -524,13 +585,13 @@ def get_context_attention_test_cases(if_unit_test=False):
             }
         ]
     else:
-        shape_sweeps = get_attention_context_shape_sweeps("vllm_xpu")
+        shape_sweeps = get_attention_context_shape_sweeps(_attn_framework_key())
 
-    # kv cache dtype fp8 to be supported
-    kv_cache_dtype_list = [False, True]
+    # (attn_compute_dtype, use_fp8_kv_cache) combos; fp8 attn compute only on CRI.
+    dtype_combos = _attn_dtype_kv_combos("context")
 
-    # XPU paged flash attention kernel supports GQA ratio up to 16
-    max_gqa_ratio = 16
+    # XPU paged flash attention GQA ratio ceiling (wider on CRI).
+    max_gqa_ratio = _max_gqa_ratio()
 
     for shape_sweep in shape_sweeps:
         batch_sizes = [int(value) for value in shape_sweep["batch_sizes"]]
@@ -541,7 +602,9 @@ def get_context_attention_test_cases(if_unit_test=False):
         max_tokens_grouped_query_attention = int(shape_sweep["max_tokens_grouped_query_attention"])
         max_kv_elements = int(shape_sweep["max_kv_elements"])
 
-        for head_config in get_attention_head_configs(shape_sweep, phase="context"):
+        for head_config in get_attention_head_configs(
+            shape_sweep, phase="context", include_model_profiles=not _yaml_profiles_only()
+        ):
             n = head_config.num_heads
             num_kv_heads = head_config.num_kv_heads
             head_dim = head_config.head_dim
@@ -556,6 +619,11 @@ def get_context_attention_test_cases(if_unit_test=False):
                 continue
             for s in sorted(sequence_lengths, reverse=True):
                 for b in sorted(batch_sizes, reverse=True):
+                    # isl==1 (max_seqlen_q==1) forces the paged decode kernel,
+                    # uncompiled for head_dim=256 at GQA ratio>8. isl>=16 uses
+                    # chunk_prefill and is unaffected.
+                    if s == 1 and n // num_kv_heads > 8:
+                        continue
                     if num_kv_heads == n:
                         if b * s > max_tokens_self_attention or b > 128:
                             continue
@@ -563,7 +631,7 @@ def get_context_attention_test_cases(if_unit_test=False):
                         continue
                     if b * s * num_kv_heads * head_dim * 2 >= max_kv_elements:
                         continue
-                    for is_fp8_kv_cache in kv_cache_dtype_list:
+                    for attn_dtype, is_fp8_kv_cache in dtype_combos:
                         if not _kv_pool_fits(num_kv_heads, head_dim):
                             _dropped_mem += 1
                             continue
@@ -578,12 +646,14 @@ def get_context_attention_test_cases(if_unit_test=False):
                                 True,
                                 window_size,
                                 head_config.has_attention_sink,
+                                attn_dtype,
                             ]
                         )
 
     if _dropped_mem:
         dev_gb = get_device_module().get_device_properties(0).total_memory / 1e9
         print(f"attention_context: dropped {_dropped_mem} cases (KV-pool memory budget, device={dev_gb:.0f}GB)")
+
     return test_cases
 
 
@@ -613,19 +683,21 @@ def get_generation_attention_test_cases():
     test_cases = []
     _dropped_mem = 0
 
-    # kv cache dtype fp8 to be supported
-    kv_cache_dtype_list = [False, True]
-    # XPU paged flash attention kernel supports GQA ratio up to 16
-    max_gqa_ratio = 16
+    # (attn_compute_dtype, use_fp8_kv_cache) combos; generation is bf16 compute.
+    dtype_combos = _attn_dtype_kv_combos("generation")
+    # XPU paged flash attention GQA ratio ceiling (wider on CRI).
+    max_gqa_ratio = _max_gqa_ratio()
 
-    for shape_sweep in get_attention_generation_shape_sweeps("vllm_xpu"):
+    for shape_sweep in get_attention_generation_shape_sweeps(_attn_framework_key()):
         batch_sizes = [int(value) for value in shape_sweep["batch_sizes"]]
         sequence_lengths = [int(value) for value in shape_sweep["sequence_lengths"]]
         supported_head_dims = {int(value) for value in shape_sweep["head_dims"]}
         supported_window_sizes = {int(value) for value in shape_sweep["window_sizes"]}
         min_drop_batch = int(shape_sweep["drop_largest_sequence_for_batch_at_least"])
 
-        for head_config in get_attention_head_configs(shape_sweep, phase="generation"):
+        for head_config in get_attention_head_configs(
+            shape_sweep, phase="generation", include_model_profiles=not _yaml_profiles_only()
+        ):
             n = head_config.num_heads
             n_kv = head_config.num_kv_heads
             head_dim = head_config.head_dim
@@ -651,7 +723,7 @@ def get_generation_attention_test_cases():
                 if b >= min_drop_batch:
                     target_s_list = target_s_list[:-1]
                 for s in target_s_list:
-                    for is_fp8_kv_cache in kv_cache_dtype_list:
+                    for attn_dtype, is_fp8_kv_cache in dtype_combos:
                         if not _kv_pool_fits(n_kv, head_dim):
                             _dropped_mem += 1
                             continue
@@ -666,6 +738,7 @@ def get_generation_attention_test_cases():
                                 False,
                                 window_size,
                                 head_config.has_attention_sink,
+                                attn_dtype,
                             ]
                         )
     if _dropped_mem:

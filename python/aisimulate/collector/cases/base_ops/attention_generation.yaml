@@ -267,3 +267,67 @@ framework_specific_op_cases:
           kv_head_counts: [1, 2, 4, 8]
           allow_xqa_mha: true
           require_divisible: true
+  # CRI uses a newer vLLM-XPU kernel (head_dim 256, wider GQA). Selected by
+  # collect_attn_xpu.py when COLLECTOR_SYSTEM == "cri"; B60 keeps the vllm_xpu
+  # sweep above untouched. sequence_lengths are powers of two so the emitted
+  # step (= sequence_length - 1) matches the customer's 2^n-1 decode steps.
+  vllm_xpu_cri:
+    attention_generation:
+      cases:
+      - id: base_attention_generation_shape_sweep
+        batch_sizes:
+        - 1
+        - 2
+        - 4
+        - 8
+        - 16
+        - 32
+        - 64
+        - 128
+        - 256
+        - 512
+        - 1024
+        - 2048
+        sequence_lengths:
+        - 2
+        - 4
+        - 8
+        - 16
+        - 32
+        - 64
+        - 128
+        - 256
+        - 512
+        - 1024
+        - 2048
+        - 4096
+        - 8192
+        - 16384
+        - 32768
+        - 65536
+        - 131072
+        mha_query_head_counts: []
+        xqa_query_head_counts:
+        - 16
+        # - 64  # TODO(JIRA): re-enable once vllm-xpu-kernels compiles paged_decode
+        #        qgroup 16/32 @ hd256 (64h/4kv=r16, 64h/2kv=r32). Currently
+        #        uncompiled -> PyTorch ref fallback -> host .cpu() sync ->
+        #        UR_RESULT_ERROR_GRAPH_CAPTURE_UNSUPPORTED (error 72) under xpu graph.
+        kv_head_counts:
+        - 2
+        - 4
+        head_dims:
+        - 256
+        window_sizes:
+        - 0
+        head_profiles:
+        - id: default_head256
+          head_dim: 256
+          window_size: 0
+          mha_query_head_counts: []
+          # 64 temporarily disabled (r16/r32 paged_decode not compiled -> graph
+          # capture error 72). TODO(JIRA): restore [16, 64] after kernel rebuild.
+          xqa_query_head_counts: [16]
+          kv_head_counts: [2, 4]
+          allow_xqa_mha: true
+          require_divisible: true

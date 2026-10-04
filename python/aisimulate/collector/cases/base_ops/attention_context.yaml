@@ -257,3 +257,54 @@ framework_specific_op_cases:
           window_size: 0
           query_head_counts: [1, 2, 4, 8, 12, 16, 24, 32, 40, 48, 64]
           kv_head_options: [1, 2, 4, 8]
+  # CRI uses a newer vLLM-XPU kernel (head_dim 256, wider GQA, fp8 Q compute).
+  # Selected by collect_attn_xpu.py when COLLECTOR_SYSTEM == "cri"; B60 keeps the
+  # vllm_xpu sweep above untouched.
+  vllm_xpu_cri:
+    attention_context:
+      cases:
+      - id: base_attention_context_shape_sweep
+        batch_sizes:
+        - 1
+        - 2
+        - 4
+        - 8
+        - 16
+        - 32
+        - 64
+        - 128
+        - 256
+        sequence_lengths:
+        - 1
+        - 16
+        - 32
+        - 64
+        - 128
+        - 256
+        - 512
+        - 1024
+        - 1536
+        - 2048
+        - 3072
+        - 4096
+        - 6144
+        - 8192
+        - 10240
+        - 12288
+        - 16384
+        query_head_counts:
+        - 16
+        - 64
+        kv_head_options:
+        - 2
+        - 4
+        head_dims:
+        - 256
+        window_sizes:
+        - 0
+        head_profiles:
+        - id: default_head256
+          head_dim: 256
+          window_size: 0
+          query_head_counts: [16, 64]
+          kv_head_options: [2, 4]
