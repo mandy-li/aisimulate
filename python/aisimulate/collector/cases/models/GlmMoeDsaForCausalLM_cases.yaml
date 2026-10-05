@@ -151,6 +151,12 @@ model_case_values:
         sglang:
           allowed_modes: [bfloat16]
       wideep: true
+      # CRI MoE: vllm_xpu_cri backend key reuses this shared row's dims; sweep
+      # "cri" + quant modes live in base_ops/moe.yaml moe_vllm_xpu_cri.
+      framework_cases:
+        vllm_xpu_cri:
+          sweep: cri
+          activation: silu
     - model_path: zai-org/GLM-5.2-FP8
       model_aliases:
         - zai-org/GLM-5.3-FP8

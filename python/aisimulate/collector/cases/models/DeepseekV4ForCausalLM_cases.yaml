@@ -68,6 +68,12 @@ model_case_values:
           # log rather than a mislabeled row.
           allowed_modes:
             - w4a8_mxfp4_mxfp8
+      # CRI MoE: vllm_xpu_cri backend key reuses this shared row's dims; sweep
+      # "cri" + quant modes live in base_ops/moe.yaml moe_vllm_xpu_cri.
+      framework_cases:
+        vllm_xpu_cri:
+          sweep: cri
+          activation: silu
     - model_path: sgl-project/DeepSeek-V4-Flash-FP8
       hidden_size: 4096
       inter_size: 2048
@@ -129,6 +135,12 @@ model_case_values:
           # See the native Flash note above (same SM100-gated trtllm-gen path).
           allowed_modes:
             - w4a8_mxfp4_mxfp8
+      # CRI MoE: vllm_xpu_cri backend key reuses this shared row's dims; sweep
+      # "cri" + quant modes live in base_ops/moe.yaml moe_vllm_xpu_cri.
+      framework_cases:
+        vllm_xpu_cri:
+          sweep: cri
+          activation: silu
     - model_path: sgl-project/DeepSeek-V4-Pro-FP8
       hidden_size: 7168
       inter_size: 3072

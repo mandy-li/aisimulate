@@ -537,7 +537,7 @@ def _attn_framework_key():
 
 
 # XPU paged flash-attention GQA ratio ceiling, per system. CRI's newer vLLM-XPU
-# kernel supports a wider GQA ratio than B60 (customer needs 64 heads / 2 KV).
+# kernel supports a wider GQA ratio than B60 (CRI targets 64 query heads / 2 KV).
 _MAX_GQA_RATIO_BY_SYSTEM = {"b60": 16, "cri": 32}
 
 

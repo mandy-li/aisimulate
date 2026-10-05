@@ -284,6 +284,12 @@ model_case_values:
           allowed_modes: []
         vllm:
           allowed_modes: [bfloat16, fp8_block]
+      # CRI MoE: vllm_xpu_cri backend key reuses this shared row's dims; sweep
+      # "cri" + quant modes live in base_ops/moe.yaml moe_vllm_xpu_cri.
+      framework_cases:
+        vllm_xpu_cri:
+          sweep: cri
+          activation: silu
     # NVFP4 collection fixture (ModelOpt experts-only recipe: routed-expert
     # linears only, other components at source precision; collector-only id, no
     # separate model_path row needed for the bf16/fp8_block artifacts above

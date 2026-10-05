@@ -270,7 +270,7 @@ framework_specific_op_cases:
   # CRI uses a newer vLLM-XPU kernel (head_dim 256, wider GQA). Selected by
   # collect_attn_xpu.py when COLLECTOR_SYSTEM == "cri"; B60 keeps the vllm_xpu
   # sweep above untouched. sequence_lengths are powers of two so the emitted
-  # step (= sequence_length - 1) matches the customer's 2^n-1 decode steps.
+  # step (= sequence_length - 1) matches the 2^n-1 decode steps.
   vllm_xpu_cri:
     attention_generation:
       cases:

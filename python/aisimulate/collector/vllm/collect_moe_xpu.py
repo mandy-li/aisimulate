@@ -38,10 +38,25 @@ from vllm.version import __version__ as vllm_version
 if torch.xpu.is_available():
     try:
         from vllm_xpu_kernels.fused_moe_interface import XpuFusedMoe
+        from vllm_xpu_kernels.moe_utils import (
+            quant_fp8_block_act,
+            quant_fp8_pertensor_act,
+            quant_mxfp_act_xpu,
+        )
     except Exception as e:
         print(f"Please refer to vllm_xpu_kernels for MoE on XPU, \n{e}")
 
 aic_debug = int(os.getenv("aic_moe_debug", "0"))  # noqa: SIM112
+
+
+def _collector_system():
+    return os.environ.get("COLLECTOR_SYSTEM") or None
+
+
+def _moe_framework_key():
+    # CRI has its own YAML sweep (balanced routing, fp8_block + mxfp8 quant,
+    # no mxfp4). B60 and any unset system keep the shared vllm_xpu sweep.
+    return "vllm_xpu_cri" if _collector_system() == "cri" else "vllm_xpu"
 
 
 def resolve_moe_activation(model_name: str) -> str:
@@ -55,18 +70,20 @@ def resolve_moe_activation(model_name: str) -> str:
     env_activation = os.getenv("AIC_COLLECTOR_MOE_ACTIVATION")
     if env_activation:
         return env_activation.strip().lower()
-    return get_moe_backend_model_activation("vllm_xpu", model_name, default="silu")
+    return get_moe_backend_model_activation(_moe_framework_key(), model_name, default="silu")
 
 
 def get_moe_xpu_test_cases():
-    return get_moe_backend_test_cases("vllm_xpu")
+    return get_moe_backend_test_cases(_moe_framework_key())
 
 
 def get_moe_test_cases():
     """Generate MoE test cases"""
 
+    framework_key = _moe_framework_key()
+
     enabled_moe_types = get_moe_quantization_modes(
-        "vllm_xpu",
+        framework_key,
         sm_version=0,
         runtime_version=vllm_version,
         runtime_features={"torch_fp8_e4m3fn": hasattr(torch, "float8_e4m3fn")},
@@ -75,9 +92,6 @@ def get_moe_test_cases():
     test_cases = []
 
     for common_moe_testcase in get_moe_xpu_test_cases():
-        if common_moe_testcase.token_expert_distribution != "power_law":
-            continue
-
         model_name = common_moe_testcase.model_name
 
         # vllm does not support TP when EP is enabled.
@@ -85,8 +99,18 @@ def get_moe_test_cases():
             continue
 
         for moe_type in enabled_moe_types:
-            if not moe_model_allows_quantization("vllm_xpu", model_name, moe_type):
+            if not moe_model_allows_quantization(framework_key, model_name, moe_type):
                 continue
+
+            # Prune bf16 cases whose per-rank w13 reaches 2**33 elements: the
+            # XPU weight-layout repack overflows int32 and fails (up/moe_bugs.md
+            # Bug 2). bf16 only; fp8_block/mxfp8 use a different repack path.
+            if moe_type == "bfloat16":
+                local_experts = common_moe_testcase.num_experts // common_moe_testcase.ep
+                local_inter = common_moe_testcase.inter_size // common_moe_testcase.tp
+                w13_numel = local_experts * 2 * local_inter * common_moe_testcase.hidden_size
+                if w13_numel >= 2**33:
+                    continue
 
             test_cases.append(
                 [
@@ -153,6 +177,8 @@ def run_moe_torch(
 
     use_mxfp4 = moe_type == "w4a16_mxfp4"
     is_fp8 = moe_type == "fp8"
+    is_fp8_block = moe_type == "fp8_block"
+    is_mxfp8 = moe_type == "mxfp8"
     activation_name = resolve_moe_activation(model_name)
 
     # Calculate local number of experts
@@ -173,13 +199,24 @@ def run_moe_torch(
         )
         w1 = w1.view(torch.float4_e2m1fn_x2).contiguous()
         w2 = w2.view(torch.float4_e2m1fn_x2).contiguous()
+    elif is_fp8_block:
+        w13_bias = w2_bias = None
+        w1, w2, w13_scales, w2_scales, local_num_experts, padded_hidden = create_fp8_block_weights_xpu(
+            num_experts, hidden_size, inter_size, moe_tp_size, moe_ep_size, device
+        )
+    elif is_mxfp8:
+        w13_bias = w2_bias = None
+        w1, w2, w13_scales, w2_scales, local_num_experts, padded_hidden = create_mxfp8_weights_xpu(
+            num_experts, hidden_size, inter_size, moe_tp_size, moe_ep_size, device
+        )
     else:
         padded_hidden = hidden_size
         w13_scales = w2_scales = None
         w13_bias = w2_bias = None
 
-        # XpuFusedMoe follows the tested vllm-xpu-kernels contract: BF16/FP8
-        # weights are stored as [E, K, N] contiguous at apply time.
+        # XpuFusedMoe takes weights in vLLM's loaded [E, N, K] layout and
+        # rewrites them to the device grouped-GEMM layout internally, so pass
+        # them as-loaded (no caller-side transpose).
         w1 = torch.randn(
             local_num_experts,
             2 * local_inter_size,
@@ -198,8 +235,6 @@ def run_moe_torch(
         if is_fp8:
             w1, w13_scales = quantize_fp8_per_expert(w1)
             w2, w2_scales = quantize_fp8_per_expert(w2)
-        w1 = w1.transpose(-1, -2).contiguous()
-        w2 = w2.transpose(-1, -2).contiguous()
 
     fused_moe_impl = XpuFusedMoe(
         w13=w1,
@@ -223,6 +258,17 @@ def run_moe_torch(
         # bfloat16 hidden states (padded hidden already selected for mxfp4 path above)
         hs_dtype = torch.bfloat16
         hidden_states = torch.randn([num_tokens, padded_hidden], dtype=hs_dtype, device=device)
+
+        # fp8 is W8A8: quantize the activation to fp8 and pass its scale.
+        # bf16 and w4a16_mxfp4 keep bf16 activations (no scale).
+        act_hidden_states = hidden_states
+        a1q_scale = None
+        if is_fp8:
+            act_hidden_states, a1q_scale = quant_fp8_pertensor_act(hidden_states)
+        elif is_fp8_block:
+            act_hidden_states, a1q_scale = quant_fp8_block_act(hidden_states)
+        elif is_mxfp8:
+            act_hidden_states, a1q_scale = quant_mxfp_act_xpu(hidden_states, "mxfp8")
 
         # Generate topk_weights and topk_ids
         num_iter = 5 if distributed == "power_law" else 1
@@ -280,16 +326,18 @@ def run_moe_torch(
                     local_num_tokens = tw.shape[0]
                     fused_moe_impl.apply(
                         output=output_list[i],
-                        hidden_states=hidden_states[:local_num_tokens],
+                        hidden_states=act_hidden_states[:local_num_tokens],
                         topk_weights=tw,
                         topk_ids=ti,
+                        a1q_scale=a1q_scale,
                     )
             else:
                 fused_moe_impl.apply(
                     output=output,
-                    hidden_states=hidden_states,
+                    hidden_states=act_hidden_states,
                     topk_weights=topk_weights,
                     topk_ids=topk_ids,
+                    a1q_scale=a1q_scale,
                 )
 
         def run_iterations():
@@ -317,7 +365,14 @@ def run_moe_torch(
 
         print(f"moe latency: {latency}")
 
-        source = "vllm_xpu_moe_mxfp4" if use_mxfp4 else "vllm_xpu_moe"
+        if use_mxfp4:
+            source = "vllm_xpu_moe_mxfp4"
+        elif is_fp8_block:
+            source = "vllm_xpu_moe_fp8_block"
+        elif is_mxfp8:
+            source = "vllm_xpu_moe_mxfp8"
+        else:
+            source = "vllm_xpu_moe"
 
         log_perf(
             item_list=[
@@ -348,6 +403,89 @@ def run_moe_torch(
 def round_up(x: int, y: int) -> int:
     """Round up x to the nearest multiple of y."""
     return ((x + y - 1) // y) * y
+
+
+def create_fp8_block_weights_xpu(
+    num_experts,
+    hidden_size,
+    inter_size,
+    moe_tp_size,
+    moe_ep_size,
+    device,
+):
+    """Fake block-wise FP8 MoE weights ([E,N,K] fp8_e4m3fn + fp32 128x128 block
+    scales; XpuFusedMoe infers the recipe). hidden/local_inter padded to 128.
+    """
+    local_inter_size = inter_size // moe_tp_size
+    padded_inter = round_up(local_inter_size, 128)
+    padded_hidden = round_up(hidden_size, 128)
+
+    expert_map_result = determine_expert_map(moe_ep_size, 0, num_experts)
+    if isinstance(expert_map_result, tuple) and len(expert_map_result) == 3:
+        local_num_experts, expert_map, _ = expert_map_result
+    else:
+        local_num_experts, expert_map = expert_map_result
+
+    w13 = torch.randn(
+        local_num_experts, 2 * padded_inter, padded_hidden, dtype=torch.bfloat16, device=device
+    ).to(torch.float8_e4m3fn)
+    w2 = torch.randn(
+        local_num_experts, padded_hidden, padded_inter, dtype=torch.bfloat16, device=device
+    ).to(torch.float8_e4m3fn)
+
+    # Block scales: fp32 [E, N // 128, K // 128] -> detected as block-fp8.
+    w13_scales = (
+        torch.rand(
+            local_num_experts, 2 * padded_inter // 128, padded_hidden // 128, dtype=torch.float32, device=device
+        )
+        + 0.5
+    )
+    w2_scales = (
+        torch.rand(
+            local_num_experts, padded_hidden // 128, padded_inter // 128, dtype=torch.float32, device=device
+        )
+        + 0.5
+    )
+    return w13, w2, w13_scales, w2_scales, local_num_experts, padded_hidden
+
+
+def create_mxfp8_weights_xpu(
+    num_experts,
+    hidden_size,
+    inter_size,
+    moe_tp_size,
+    moe_ep_size,
+    device,
+):
+    """Fake MXFP8 MoE weights ([E,N,K] fp8_e4m3fn + e8m0 per-32-block scales;
+    XpuFusedMoe infers the recipe). hidden/local_inter padded to 128.
+    """
+    mxfp8_block = 32
+    local_inter_size = inter_size // moe_tp_size
+    padded_inter = round_up(local_inter_size, 128)
+    padded_hidden = round_up(hidden_size, 128)
+
+    expert_map_result = determine_expert_map(moe_ep_size, 0, num_experts)
+    if isinstance(expert_map_result, tuple) and len(expert_map_result) == 3:
+        local_num_experts, expert_map, _ = expert_map_result
+    else:
+        local_num_experts, expert_map = expert_map_result
+
+    w13 = torch.randn(
+        local_num_experts, 2 * padded_inter, padded_hidden, dtype=torch.bfloat16, device=device
+    ).to(torch.float8_e4m3fn)
+    w2 = torch.randn(
+        local_num_experts, padded_hidden, padded_inter, dtype=torch.bfloat16, device=device
+    ).to(torch.float8_e4m3fn)
+
+    # e8m0 block scales (uint8 bits near exponent 127 == 2^0) -> detected as mxfp8.
+    w13_scales = torch.randint(
+        118, 136, (local_num_experts, 2 * padded_inter, padded_hidden // mxfp8_block), dtype=torch.uint8, device=device
+    ).view(torch.float8_e8m0fnu)
+    w2_scales = torch.randint(
+        118, 136, (local_num_experts, padded_hidden, padded_inter // mxfp8_block), dtype=torch.uint8, device=device
+    ).view(torch.float8_e8m0fnu)
+    return w13, w2, w13_scales, w2_scales, local_num_experts, padded_hidden
 
 
 def create_mxfp4_weights_xpu(

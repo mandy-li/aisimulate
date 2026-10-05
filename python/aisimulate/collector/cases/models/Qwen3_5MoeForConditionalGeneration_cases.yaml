@@ -61,6 +61,12 @@ model_case_values:
       sglang_moe_backends:
         bfloat16: {100: flashinfer_trtllm, 103: flashinfer_trtllm}
         fp8_block: {100: flashinfer_trtllm, 103: flashinfer_trtllm}
+      # CRI MoE: vllm_xpu_cri backend key reuses this shared row's dims; sweep
+      # "cri" + quant modes live in base_ops/moe.yaml moe_vllm_xpu_cri.
+      framework_cases:
+        vllm_xpu_cri:
+          sweep: cri
+          activation: silu
     - model_path: Qwen/Qwen3.5-122B-A10B
       hidden_size: 3072
       inter_size: 1024
