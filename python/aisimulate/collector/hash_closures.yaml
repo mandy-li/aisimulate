@@ -253,6 +253,14 @@ collector.vllm.collect_moe:
 collector.vllm.collect_moe_xpu:
   - collector/cases/base_ops/moe.yaml
   - __model_cases__
+collector.vllm.collect_moe_ep_xpu:
+  # Sweep lives in moe.yaml common_case_values.moe_ep. Row builder and
+  # kernel_source label are imported from the CUDA moe_ep module; the
+  # fp8_block weight builder from collect_moe_xpu.
+  - collector/cases/base_ops/moe.yaml
+  - collector/wideep/vllm/collect_moe_ep.py
+  - collector/vllm/collect_moe_xpu.py
+  - __model_cases__
 
 # --- network (standalone comm collectors) ------------------------------
 collector.network.slurm.collect_trtllm_alltoall:
