@@ -43,3 +43,26 @@ common_case_values:
     - 256
     - 512
     - 1024
+    # vLLM-XPU GDN models (tp-local heads). See get_xpu_gdn_test_cases.
+    xpu_models:
+    - model_path: Qwen/Qwen3.6-35B-A3B
+      d_model: 2048
+      d_conv: 4
+      num_k_heads: 16
+      head_k_dim: 128
+      num_v_heads: 32
+      head_v_dim: 128
+    - model_path: Qwen/Qwen3.8-Flash-Next
+      d_model: 2560
+      d_conv: 4
+      num_k_heads: 16
+      head_k_dim: 128
+      num_v_heads: 48
+      head_v_dim: 128
+    - model_path: Qwen/Qwen3.8-2.4T-A95B
+      d_model: 8192
+      d_conv: 4
+      num_k_heads: 16
+      head_k_dim: 128
+      num_v_heads: 128
+      head_v_dim: 128

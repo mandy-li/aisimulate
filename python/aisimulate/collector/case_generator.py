@@ -2227,6 +2227,77 @@ def get_common_gdn_test_cases() -> list[GdnCommonTestCase]:
     return test_cases
 
 
+def get_xpu_gdn_test_cases() -> list[GdnCommonTestCase]:
+    """
+    GDN cases for the vLLM-XPU (CRI) fused ``gdn_attention`` collector.
+
+    Overrides ``get_common_gdn_test_cases``: instead of expanding every GDN
+    model over its tensor-parallel sizes, this sweeps the curated model set
+    declared under ``common_case_values.gdn.xpu_models``. Those head counts
+    are already tp-local (tp_size=1). Batch/seq density is the shared base grid.
+    """
+    gdn_sweep = _required_base_common_case_values("gdn")
+    context_seq_lens = _as_int_list(
+        gdn_sweep.get("context_sequence_lengths"),
+        field_name="gdn.context_sequence_lengths",
+    )
+    context_batch_sizes = _as_int_list(
+        gdn_sweep.get("context_batch_sizes"),
+        field_name="gdn.context_batch_sizes",
+    )
+    generation_batch_sizes = _as_int_list(
+        gdn_sweep.get("generation_batch_sizes"),
+        field_name="gdn.generation_batch_sizes",
+    )
+
+    raw_models = gdn_sweep.get("xpu_models")
+    if not isinstance(raw_models, list):
+        raise RuntimeError(f"{BASE_OP_CASES_DIR} is missing common_case_values.gdn.xpu_models")
+
+    test_cases: list[GdnCommonTestCase] = []
+    for model_config in raw_models:
+        if not isinstance(model_config, dict):
+            raise TypeError("common_case_values.gdn.xpu_models entries must be mappings")
+        d_model = int(model_config["d_model"])
+        d_conv = int(model_config["d_conv"])
+        num_k_heads = int(model_config["num_k_heads"])
+        head_k_dim = int(model_config["head_k_dim"])
+        num_v_heads = int(model_config["num_v_heads"])
+        head_v_dim = int(model_config["head_v_dim"])
+        model_name = str(model_config["model_path"])
+
+        test_cases.append(
+            GdnCommonTestCase(
+                phase="context",
+                d_model=d_model,
+                d_conv=d_conv,
+                num_k_heads=num_k_heads,
+                head_k_dim=head_k_dim,
+                num_v_heads=num_v_heads,
+                head_v_dim=head_v_dim,
+                batch_size_list=context_batch_sizes,
+                seq_len_list=context_seq_lens,
+                model_name=model_name,
+            )
+        )
+        test_cases.append(
+            GdnCommonTestCase(
+                phase="generation",
+                d_model=d_model,
+                d_conv=d_conv,
+                num_k_heads=num_k_heads,
+                head_k_dim=head_k_dim,
+                num_v_heads=num_v_heads,
+                head_v_dim=head_v_dim,
+                batch_size_list=generation_batch_sizes,
+                seq_len_list=None,
+                model_name=model_name,
+            )
+        )
+
+    return test_cases
+
+
 # =============================================================================
 # KDA (Kimi Delta Attention) Test Cases  — Kimi-K3 linear_attention layers
 # =============================================================================
