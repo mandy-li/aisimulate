@@ -37,8 +37,12 @@ from vllm.version import __version__ as vllm_version
 
 if torch.xpu.is_available():
     try:
-        from vllm.model_executor.layers.fused_moe.experts.xpu_moe import prepare_fp8_moe_layer_for_xpu
         from vllm_xpu_kernels.fused_moe_interface import XpuFusedMoe
+        from vllm_xpu_kernels.moe_utils import (
+            quant_fp8_block_act,
+            quant_fp8_pertensor_act,
+            quant_mxfp_act_xpu,
+        )
     except Exception as e:
         print(f"Please refer to vllm_xpu_kernels for MoE on XPU, \n{e}")
 
@@ -210,7 +214,9 @@ def run_moe_torch(
         w13_scales = w2_scales = None
         w13_bias = w2_bias = None
 
-        # vLLM's loaded [E, N, K] layout; transposed below as serving does.
+        # XpuFusedMoe takes weights in vLLM's loaded [E, N, K] layout and
+        # rewrites them to the device grouped-GEMM layout internally, so pass
+        # them as-loaded (no caller-side transpose).
         w1 = torch.randn(
             local_num_experts,
             2 * local_inter_size,
@@ -229,17 +235,6 @@ def run_moe_torch(
         if is_fp8:
             w1, w13_scales = quantize_fp8_per_expert(w1)
             w2, w2_scales = quantize_fp8_per_expert(w2)
-
-    # XpuFusedMoe needs non-4-bit weights as [E, K, N] (it reads inter_size
-    # from w13.shape[-1]). Mirror vLLM v0.28.0, which transposes the loaded
-    # [E, N, K] weights before building it: prepare_fp8_moe_layer_for_xpu for
-    # fp8 / fp8_block / mxfp8 (oracle/fp8.py), a plain transpose for bf16
-    # (unquantized_fused_moe_method.py). MXFP4 stays [E, N, K].
-    if is_fp8 or is_fp8_block or is_mxfp8:
-        w1, w13_scales, w2, w2_scales = prepare_fp8_moe_layer_for_xpu(w1, w13_scales, w2, w2_scales)
-    elif not use_mxfp4:
-        w1 = w1.transpose(-1, -2).contiguous()
-        w2 = w2.transpose(-1, -2).contiguous()
 
     fused_moe_impl = XpuFusedMoe(
         w13=w1,
@@ -264,11 +259,16 @@ def run_moe_torch(
         hs_dtype = torch.bfloat16
         hidden_states = torch.randn([num_tokens, padded_hidden], dtype=hs_dtype, device=device)
 
-        # bf16 activations with no scale for every dtype: on Xe2/Xe3
-        # XPUExperts.expects_unquantized_inputs is True, so vLLM's prepare step
-        # (defer_input_quant) skips input quant and the fp8 GEMMs run W8A16.
+        # fp8 is W8A8: quantize the activation to fp8 and pass its scale.
+        # bf16 and w4a16_mxfp4 keep bf16 activations (no scale).
         act_hidden_states = hidden_states
         a1q_scale = None
+        if is_fp8:
+            act_hidden_states, a1q_scale = quant_fp8_pertensor_act(hidden_states)
+        elif is_fp8_block:
+            act_hidden_states, a1q_scale = quant_fp8_block_act(hidden_states)
+        elif is_mxfp8:
+            act_hidden_states, a1q_scale = quant_mxfp_act_xpu(hidden_states, "mxfp8")
 
         # Generate topk_weights and topk_ids
         num_iter = 5 if distributed == "power_law" else 1
