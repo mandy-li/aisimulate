@@ -29,17 +29,20 @@ serving path into ``XPUExperts`` (``fused_moe/experts/xpu_moe.py``):
   would inflate memory and elementwise time ~ep-fold. The persisted
   ``num_tokens`` stays the GLOBAL count.
 * Expert ids are global; unrouted slots get ``num_experts - 1`` (a non-local
-  expert for rank 0), exactly as ``prepare_finalize/deepep_ht.py`` rewrites
+  expert for rank 0), as upstream ``prepare_finalize/deepep_ht.py`` rewrites
   DeepEP's ``-1``. ``XpuFusedMoe``'s expert map (``init_expert_map``, linear
-  placement = vLLM's default) maps it back to local ``-1``, which
-  ``remap_hidden_states`` skips.
-* Block-FP8 weights go through vLLM's ``prepare_fp8_moe_layer_for_xpu``
-  (``[E, N, K]`` -> ``[E, K, N]``, scales likewise), as ``oracle/fp8.py`` does
-  for ``Fp8MoeBackend.XPU``.
-* Activations reach the kernel as bf16 with ``a1q_scale=None``: on Xe2/Xe3
-  ``XPUExperts.expects_unquantized_inputs`` is True, so the modular kernel
-  passes ``defer_input_quant`` and DeepEP HT prepare skips input quantization;
-  the block-FP8 GEMMs run W8A16.
+  placement = vLLM's default) maps any non-local id to local ``-1``.
+* Weights and activations follow the CRI ``moe`` collector
+  (``collect_moe_xpu.py``), verified against the installed vLLM-XPU image
+  (a fork build, not upstream v0.28.0):
+
+  - Block-FP8 weights are passed in vLLM's loaded ``[E, N, K]`` layout with
+    ``[E, N/128, K/128]`` scales, untransposed. The image's ``XpuFusedMoe``
+    reads ``inter_size`` from ``w13.shape[-2]`` for this input.
+  - Activations are block-quantized to FP8 (``quant_fp8_block_act``) outside
+    the timed region and passed with ``a1q_scale``: the image's
+    ``XPUExperts`` sets ``expects_unquantized_inputs = not is_xe3p``, so on
+    CRI (Xe3P) vLLM quantizes inputs in prepare, before DeepEP dispatch.
 * An OOM skips the remaining (larger) token counts of that phase/distribution
   series instead of aborting the case; the case still raises at the end so the
   gap is classified.
@@ -50,9 +53,9 @@ __compat__ = "vllm==0.28.0"
 import gc
 
 import torch
-from vllm.model_executor.layers.fused_moe.experts.xpu_moe import prepare_fp8_moe_layer_for_xpu
 from vllm.version import __version__ as vllm_version
 from vllm_xpu_kernels.fused_moe_interface import XpuFusedMoe
+from vllm_xpu_kernels.moe_utils import quant_fp8_block_act
 
 from collector.case_generator import get_xpu_moe_ep_test_cases
 from collector.helper import (
@@ -127,9 +130,8 @@ def _make_xpu_fused_moe_bench(
     device,
 ):
     """Build the ``bench(phase, global_num_tokens, distributed, alpha)`` callable for one case."""
-    # vLLM's loaded layout ([E, N, K] fp8 + [E, N/128, K/128] scales), then the
-    # same transpose serving applies (Fp8MoeBackend.XPU -> [E, K, N], which
-    # XpuFusedMoe requires: it reads inter_size from w13.shape[-1]).
+    # [E, N, K] fp8 + [E, N/128, K/128] scales, passed as-is (the CRI image's
+    # XpuFusedMoe takes this layout for block-FP8; see the module docstring).
     w13, w2, w13_scales, w2_scales, local_num_experts, padded_hidden = create_fp8_block_weights_xpu(
         num_experts, hidden_size, inter_size, 1, moe_ep_size, device
     )
@@ -137,9 +139,6 @@ def _make_xpu_fused_moe_bench(
         raise MoeEpBenchmarkError(
             f"determine_expert_map gave {local_num_experts} local experts, case declares {num_local_experts}"
         )
-    w13, w13_scales, w2, w2_scales = prepare_fp8_moe_layer_for_xpu(w13, w13_scales, w2, w2_scales)
-    gc.collect()
-    get_device_module().empty_cache()
     fused_moe_impl = XpuFusedMoe(
         w13=w13,
         w13_scales=w13_scales,
@@ -203,15 +202,18 @@ def _make_xpu_fused_moe_bench(
         topk_ids, topk_weights = _routing(inference_phase, global_num_tokens, distributed, power_law_alpha)
         num_recv_tokens = topk_ids.shape[0]
         hidden_states = torch.randn(num_recv_tokens, padded_hidden, dtype=torch.bfloat16, device=device)
+        # Xe3P serving quantizes in prepare (before dispatch), so outside the timed region.
+        act_hidden_states, a1q_scale = quant_fp8_block_act(hidden_states)
         output = torch.empty_like(hidden_states)
+        del hidden_states
 
         def kernel_func():
             fused_moe_impl.apply(
                 output=output,
-                hidden_states=hidden_states,
+                hidden_states=act_hidden_states,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
-                a1q_scale=None,  # Xe2/Xe3 serving defers input quant: bf16 activations
+                a1q_scale=a1q_scale,
             )
 
         with benchmark_with_power(
