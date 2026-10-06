@@ -43,14 +43,21 @@ serving path into ``XPUExperts`` (``fused_moe/experts/xpu_moe.py``):
     the timed region and passed with ``a1q_scale``: the image's
     ``XPUExperts`` sets ``expects_unquantized_inputs = not is_xe3p``, so on
     CRI (Xe3P) vLLM quantizes inputs in prepare, before DeepEP dispatch.
-* An OOM skips the remaining (larger) token counts of that phase/distribution
-  series instead of aborting the case; the case still raises at the end so the
-  gap is classified.
+* Points whose estimated ``XpuFusedMoe`` intermediates exceed a fraction of
+  device memory are skipped before launch. On CRI such points do not raise a
+  catchable OOM: they end in ``UR_RESULT_ERROR_DEVICE_LOST``, which kills the
+  worker and fails every later case on it. Measured: DSv4-Pro ep=128 power_law
+  context ran at 376,656 kernel inputs and was lost at 2,394,090. Like the
+  GDN collector's grid-y pre-skip, these are printed and skipped (with the
+  larger token counts of that phase/distribution series), not raised. A real
+  OOM means the estimate was too low: it also skips the rest of its series,
+  but the case raises at the end listing those points.
 """
 
 __compat__ = "vllm==0.28.0"
 
 import gc
+import os
 
 import torch
 from vllm.version import __version__ as vllm_version
@@ -78,6 +85,15 @@ from collector.wideep.vllm.collect_moe_ep import (
 )
 
 _DISTRIBUTIONS = ("uniform", "power_law")
+
+# Fraction of device memory the estimated per-launch intermediates may use.
+# Headroom covers weights, allocator slack and the second buffer set an
+# XPU-graph capture holds.
+_MEM_FRACTION = float(os.getenv("aic_moe_ep_mem_fraction", "0.5"))  # noqa: SIM112
+
+
+class _PointExceedsMemoryBudget(Exception):
+    """A token point is pre-skipped: launching it would exhaust device memory."""
 
 
 def get_moe_ep_test_cases():
@@ -198,9 +214,26 @@ def _make_xpu_fused_moe_bench(
         )
         return _counts_to_topk_ids(tokens_per_local_expert, global_num_tokens)
 
+    mem_budget = _MEM_FRACTION * get_device_module().get_device_properties(device).total_memory
+
+    def _estimated_bytes(num_recv_tokens: int) -> int:
+        """Upper estimate of what one apply allocates; every buffer is sized by rows * topk."""
+        num_moe_inputs = num_recv_tokens * topk
+        per_input = (
+            padded_hidden * (1 + 2 + 2)  # fp8 remapped input, its bf16 dequant, bf16 GEMM2 output
+            + inter_size * (2 * 2 + 2 + 1 + 2)  # bf16 GEMM1 output, bf16 act, fp8 requant + bf16 dequant
+        )
+        return num_moe_inputs * per_input + num_recv_tokens * padded_hidden * (1 + 2)  # fp8 input, bf16 output
+
     def bench(inference_phase: str, global_num_tokens: int, distributed: str, power_law_alpha):
         topk_ids, topk_weights = _routing(inference_phase, global_num_tokens, distributed, power_law_alpha)
         num_recv_tokens = topk_ids.shape[0]
+        estimated = _estimated_bytes(num_recv_tokens)
+        if estimated > mem_budget:
+            raise _PointExceedsMemoryBudget(
+                f"{num_recv_tokens} rows x topk {topk} -> ~{estimated / 1e9:.1f} GB > "
+                f"budget {mem_budget / 1e9:.1f} GB (aic_moe_ep_mem_fraction={_MEM_FRACTION})"
+            )
         hidden_states = torch.randn(num_recv_tokens, padded_hidden, dtype=torch.bfloat16, device=device)
         # Xe3P serving quantizes in prepare (before dispatch), so outside the timed region.
         act_hidden_states, a1q_scale = quant_fp8_block_act(hidden_states)
@@ -252,8 +285,9 @@ def run_moe_ep_torch(
 ):
     """Run one declared CRI large-EP MoE compute case through ``XpuFusedMoe``.
 
-    Execute-or-raise: a failing token point raises ``MoeEpBenchmarkError``
-    with the case parameters, never a silent skip.
+    A failing token point raises ``MoeEpBenchmarkError`` with the case
+    parameters. The only skips are printed memory-budget pre-skips and
+    OOM'd series, which are raised at the end of the case.
     """
     if moe_dtype != MOE_EP_QUANT_MODE:
         raise MoeEpBenchmarkError(
@@ -280,20 +314,35 @@ def run_moe_ep_torch(
 
     oom_points = []
     for inference_phase, token_counts in (("context", context_token_counts), ("generation", generation_token_counts)):
-        oom_series = set()
+        # (distributed, alpha) -> "budget" | "OOM". Points are sorted by token
+        # count within a series: once one is too large, every larger one is too.
+        skipped_series = {}
         for distributed, power_law_alpha, global_num_tokens in _phase_points(token_counts, distributions):
-            # Points are sorted by token count within a series: after an OOM,
-            # every larger point of that series would OOM too.
-            if (distributed, power_law_alpha) in oom_series:
-                oom_points.append((inference_phase, distributed, power_law_alpha, global_num_tokens))
+            point = (inference_phase, distributed, power_law_alpha, global_num_tokens)
+            label = (
+                f"moe_ep {inference_phase} skip {model_name} ep={moe_ep_size} "
+                f"{distributed} alpha={power_law_alpha} global_num_tokens={global_num_tokens}"
+            )
+            series_skip = skipped_series.get((distributed, power_law_alpha))
+            if series_skip == "OOM":
+                oom_points.append(point)
+                continue
+            if series_skip == "budget":
+                print(f"{label} (larger than a memory-budget skip)")
                 continue
             try:
                 latency_ms, power_stats = bench(inference_phase, global_num_tokens, distributed, power_law_alpha)
             except MoeEpBenchmarkError:
                 raise
+            except _PointExceedsMemoryBudget as e:
+                # skip: an over-budget launch is an uncatchable DEVICE_LOST (see
+                # the module docstring), so this is a deliberate pre-launch skip.
+                skipped_series[(distributed, power_law_alpha)] = "budget"
+                print(f"{label} ({e})")
+                continue
             except torch.OutOfMemoryError:
-                oom_series.add((distributed, power_law_alpha))
-                oom_points.append((inference_phase, distributed, power_law_alpha, global_num_tokens))
+                skipped_series[(distributed, power_law_alpha)] = "OOM"
+                oom_points.append(point)
                 gc.collect()
                 get_device_module().empty_cache()
                 continue
@@ -334,9 +383,9 @@ def run_moe_ep_torch(
 
     if oom_points:
         raise MoeEpBenchmarkError(
-            f"moe_ep OOM (model={model_name}, moe_ep_size={moe_ep_size}); "
-            f"{len(oom_points)} point(s) not collected as (phase, distribution, alpha, global_num_tokens): "
-            f"{oom_points}"
+            f"moe_ep OOM (model={model_name}, moe_ep_size={moe_ep_size}) despite the memory-budget guard; "
+            f"lower aic_moe_ep_mem_fraction (now {_MEM_FRACTION}). {len(oom_points)} point(s) not collected as "
+            f"(phase, distribution, alpha, global_num_tokens): {oom_points}"
         )
 
 
