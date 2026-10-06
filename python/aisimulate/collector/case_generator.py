@@ -2375,6 +2375,60 @@ def get_xpu_gdn_test_cases() -> list[GdnCommonTestCase]:
     return test_cases
 
 
+def get_xpu_mla_module_test_cases(phase: str) -> list[list]:
+    """Curated vLLM-XPU (CRI) MLA/DSA module cases (GLM-5.3 DSA ctx+gen).
+
+    Shape geometry is read from each model's HF config by the collector; only
+    the sweep axes + model path come from ``common_case_values.mla_module.xpu*``.
+    Returns positional case lists matching ``run_mla_module_worker``:
+    ``[seq_len, batch_size, num_heads, kv_cache_dtype, compute_dtype, gemm_type,
+    model_path, attn_type, (prefix_len)]``.
+    """
+    if phase not in ("context", "generation"):
+        raise ValueError(f"phase must be 'context' or 'generation', got {phase!r}")
+
+    values = _required_base_common_case_values("mla_module")
+    raw_models = values.get("xpu_models")
+    if not isinstance(raw_models, list):
+        raise RuntimeError(f"{BASE_OP_CASES_DIR} is missing common_case_values.mla_module.xpu_models")
+
+    xpu = _required_mapping(values.get("xpu"), field_name="mla_module.xpu")
+    num_heads_list = _as_int_list(xpu.get("num_heads"), field_name="mla_module.xpu.num_heads")
+    combos = xpu.get("precision_combos")
+    if not isinstance(combos, list):
+        raise TypeError("mla_module.xpu.precision_combos must be a list")
+
+    phase_cfg = _required_mapping(xpu.get(phase), field_name=f"mla_module.xpu.{phase}")
+    batch_sizes = _as_int_list(phase_cfg.get("batch_sizes"), field_name=f"mla_module.xpu.{phase}.batch_sizes")
+    seq_lens = _as_int_list(phase_cfg.get("sequence_lengths"), field_name=f"mla_module.xpu.{phase}.sequence_lengths")
+    prefix_lengths = (
+        _optional_int_list(phase_cfg.get("prefix_lengths"), field_name="mla_module.xpu.context.prefix_lengths", default=[0])
+        if phase == "context"
+        else [0]
+    )
+
+    cases: list[list] = []
+    for model_config in raw_models:
+        if not isinstance(model_config, dict):
+            raise TypeError("common_case_values.mla_module.xpu_models entries must be mappings")
+        model_path = str(model_config["model_path"])
+        attn_type = str(model_config["attention_type"])
+        for combo in combos:
+            compute_dtype = str(combo["compute_dtype"])
+            kv_dtype = str(combo["kv_cache_dtype"])
+            gemm_type = str(combo["gemm_type"])
+            for num_heads in num_heads_list:
+                for b in batch_sizes:
+                    for s in seq_lens:
+                        base = [s, b, num_heads, kv_dtype, compute_dtype, gemm_type, model_path, attn_type]
+                        if phase == "context":
+                            for prefix_len in prefix_lengths:
+                                cases.append([*base, prefix_len])
+                        else:
+                            cases.append(base)
+    return cases
+
+
 # =============================================================================
 # KDA (Kimi Delta Attention) Test Cases  — Kimi-K3 linear_attention layers
 # =============================================================================

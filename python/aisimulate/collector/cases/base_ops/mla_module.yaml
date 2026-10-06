@@ -59,6 +59,53 @@ common_case_values:
       - 'generation: batch_size * sequence_length <= 262144'
       - 'generation: sequence_length >= 8192 requires batch_size <= 16'
     # top_level_head_counts keep ModelRunner-loading subprocess counts manageable.
+    # vLLM-XPU DSA subset for GLM-5.3 ctx+gen. Shape
+    # geometry (q/kv lora, rope/nope, index_topk) comes from the HF config; only
+    # the sweep axes + model path live here. Heads are tp-local (tp_size=1).
+    xpu_models:
+      - model_path: zai-org/GLM-5.3
+        attention_type: dsa
+    xpu:
+      num_heads:
+        - 64
+      # fp8 kv-cache not yet supported by XPU MLA Sparse backend; using bf16 kv.
+      precision_combos:
+        - compute_dtype: bfloat16
+          kv_cache_dtype: bfloat16
+          gemm_type: bfloat16
+        - compute_dtype: bfloat16
+          kv_cache_dtype: bfloat16
+          gemm_type: fp8_block
+        # - compute_dtype: bfloat16
+        #   kv_cache_dtype: fp8
+        #   gemm_type: bfloat16
+        # - compute_dtype: bfloat16
+        #   kv_cache_dtype: fp8
+        #   gemm_type: fp8_block
+      context:
+        batch_sizes:
+          - 1
+          - 2
+          - 4
+          - 8
+        sequence_lengths:
+          - 3072
+          - 16384
+          - 76800
+          - 102400
+        prefix_lengths:
+          - 0
+      generation:
+        batch_sizes:
+          - 1
+          - 4
+          - 16
+          - 64
+        sequence_lengths:
+          - 3072
+          - 16384
+          - 76800
+          - 102400
   mla_module_sglang:
     description: SGLang full MLA/DSA module sweep. Quantized DSA checkpoints keep DSA projections in bf16 but may use fp8 KV cache.
     module_tp_sizes:

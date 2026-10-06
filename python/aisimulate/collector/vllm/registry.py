@@ -222,6 +222,20 @@ REGISTRY_XPU: list[OpEntry] = [
         perf_filename=PerfFile.MOE,
     ),
     OpEntry(
+        op="dsa_context_module",
+        module="collector.vllm.collect_mla_module_xpu",
+        get_func="get_dsa_context_module_test_cases",
+        run_func="run_mla_module_worker",
+        perf_filename=PerfFile.DSA_CONTEXT_MODULE,
+    ),
+    OpEntry(
+        op="dsa_generation_module",
+        module="collector.vllm.collect_mla_module_xpu",
+        get_func="get_dsa_generation_module_test_cases",
+        run_func="run_mla_module_worker",
+        perf_filename=PerfFile.DSA_GENERATION_MODULE,
+    ),
+    OpEntry(
         op="gdn",
         module="collector.vllm.collect_gdn_xpu",
         get_func="get_gdn_test_cases",
