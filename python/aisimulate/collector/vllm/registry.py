@@ -228,4 +228,11 @@ REGISTRY_XPU: list[OpEntry] = [
         run_func="run_gdn_torch",
         perf_filename=PerfFile.GDN,
     ),
+    OpEntry(
+        op="moe_ep",
+        module="collector.vllm.collect_moe_ep_xpu",
+        get_func="get_moe_ep_test_cases",
+        run_func="run_moe_ep_torch",
+        perf_filename=PerfFile.MOE_EXPERT_COMPUTE,
+    ),
 ]

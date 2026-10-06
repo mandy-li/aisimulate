@@ -1479,6 +1479,83 @@ def get_moe_backend_test_cases(backend: str) -> list[MoeCommonTestCase]:
     return test_cases
 
 
+@dataclasses.dataclass
+class MoeEpXpuTestCase:
+    """One (model, ep) large-EP MoE expert-compute case for the vLLM-XPU collector."""
+
+    hidden_size: int
+    inter_size: int
+    topk: int
+    num_experts: int
+    ep: int
+    model_name: str
+    context_token_counts: list[int]  # GLOBAL tokens (per-rank * ep)
+    generation_token_counts: list[int]  # GLOBAL tokens (per-rank * ep)
+    token_expert_distributions: list[tuple[str, Optional[float]]]
+
+
+def get_xpu_moe_ep_test_cases(backend: str = "vllm_xpu_cri") -> list[MoeEpXpuTestCase]:
+    """
+    Large-EP MoE expert-compute cases for the vLLM-XPU (CRI) ``moe_ep`` collector.
+
+    ``common_case_values.moe_ep`` holds the sweep policy only: EP sizes,
+    per-phase GLOBAL token counts, token-expert distributions, and a
+    ``model_paths`` allowlist. Model dimensions come from the ``backend`` MoE
+    model rows (``framework_cases.<backend>`` or
+    ``framework_specific_model_case_values.<backend>``); allowlist entries match
+    by path or alias. moe_tp_size is fixed at 1. EP sizes that do not evenly
+    shard a model's experts are skipped. An allowlisted model with no
+    ``backend`` row raises, unless a model-path filter is active.
+    """
+    sweep = _required_base_common_case_values("moe_ep")
+    context_token_counts = _as_int_list(
+        sweep.get("context_token_counts"),
+        field_name="moe_ep.context_token_counts",
+    )
+    generation_token_counts = _as_int_list(
+        sweep.get("generation_token_counts"),
+        field_name="moe_ep.generation_token_counts",
+    )
+    ep_list = _as_int_list(sweep.get("expert_parallel_sizes"), field_name="moe_ep.expert_parallel_sizes")
+    token_distributions = _moe_token_expert_distributions(sweep)
+
+    model_paths = _as_str_list(sweep.get("model_paths"), field_name="moe_ep.model_paths")
+
+    # Already narrowed by any COLLECTOR_MODEL_PATH filter.
+    backend_model_cases = _moe_backend_model_cases(backend)
+    test_cases: list[MoeEpXpuTestCase] = []
+    for model_path in model_paths:
+        model_config = next(
+            (case for case in backend_model_cases if _model_case_matches_path(case, model_path)),
+            None,
+        )
+        if model_config is None:
+            if _get_model_path_filter():
+                continue
+            raise RuntimeError(
+                f"common_case_values.moe_ep.model_paths entry {model_path!r} has no moe_{backend} model row "
+                f"(framework_cases.{backend} or framework_specific_model_case_values.{backend})"
+            )
+        num_experts = int(model_config["num_experts"])
+        for ep in ep_list:
+            if ep > num_experts or num_experts % ep != 0:
+                continue
+            test_cases.append(
+                MoeEpXpuTestCase(
+                    hidden_size=int(model_config["hidden_size"]),
+                    inter_size=int(model_config["inter_size"]),
+                    topk=int(model_config["topk"]),
+                    num_experts=num_experts,
+                    ep=ep,
+                    model_name=model_path,
+                    context_token_counts=context_token_counts,
+                    generation_token_counts=generation_token_counts,
+                    token_expert_distributions=token_distributions,
+                )
+            )
+    return test_cases
+
+
 def get_common_moe_test_cases(
     *,
     backend: str | None = None,

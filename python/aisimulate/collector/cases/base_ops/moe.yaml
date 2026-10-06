@@ -368,3 +368,28 @@ common_case_values:
       requires_runtime_feature: torch_fp8_e4m3fn
     - name: mxfp8
       requires_runtime_feature: torch_fp8_e4m3fn
+  # CRI large-EP MoE expert compute (op moe_ep, collect_moe_ep_xpu.py; WideEP
+  # wideep_context_moe / wideep_generation_moe). fp8_block only, moe_tp_size
+  # fixed at 1. token_counts are GLOBAL tokens (the persisted num_tokens key,
+  # = per-rank tokens * moe_ep_size). Cases per phase: 4 models x 4 ep x
+  # 2 distributions x 8 token counts = 256. See get_xpu_moe_ep_test_cases.
+  moe_ep:
+    context_token_counts: [32, 128, 512, 2048, 8192, 32768, 131072, 524288]
+    generation_token_counts: [2, 8, 32, 128, 512, 2048, 8192, 32768]
+    expert_parallel_sizes: [4, 16, 64, 128]
+    # "balanced (alpha=0.0)" is persisted as "uniform": the even-spread label
+    # the moe_expert_compute consumer falls back to.
+    token_expert_distributions:
+    - name: uniform
+      power_law_alpha: 0.0
+    - name: power_law
+      power_law_alpha: 1.2
+    # Model allowlist only: dimensions come from each model's moe_vllm_xpu_cri
+    # declaration in cases/models (framework_cases.vllm_xpu_cri or
+    # framework_specific_model_case_values.vllm_xpu_cri). Aliases match, e.g.
+    # GLM-5.3 resolves to the zai-org/GLM-5.2 row.
+    model_paths:
+    - deepseek-ai/DeepSeek-V4-Flash
+    - deepseek-ai/DeepSeek-V4-Pro
+    - zai-org/GLM-5.3
+    - deepseek-ai/DeepSeek-V4.1-Flash
