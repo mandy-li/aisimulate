@@ -226,40 +226,50 @@ def _make_xpu_fused_moe_bench(
         return num_moe_inputs * per_input + num_recv_tokens * padded_hidden * (1 + 2)  # fp8 input, bf16 output
 
     def bench(inference_phase: str, global_num_tokens: int, distributed: str, power_law_alpha):
-        topk_ids, topk_weights = _routing(inference_phase, global_num_tokens, distributed, power_law_alpha)
-        num_recv_tokens = topk_ids.shape[0]
-        estimated = _estimated_bytes(num_recv_tokens)
+        # Sampling and timing match the CRI moe collector (collect_moe_xpu.py):
+        # power_law times 5 independent routing draws back to back in one call
+        # (1 warmup / 1 run) and reports the per-draw average; uniform is
+        # deterministic, so 1 draw with 3 warmups / 6 runs.
+        num_draws = 5 if distributed == "power_law" else 1
+        num_warmups, num_runs = (1, 1) if distributed == "power_law" else (3, 6)
+        draws = [_routing(inference_phase, global_num_tokens, distributed, power_law_alpha) for _ in range(num_draws)]
+        max_recv_tokens = max(topk_ids.shape[0] for topk_ids, _ in draws)
+        estimated = _estimated_bytes(max_recv_tokens)
         if estimated > mem_budget:
             raise _PointExceedsMemoryBudget(
-                f"{num_recv_tokens} rows x topk {topk} -> ~{estimated / 1e9:.1f} GB > "
+                f"{max_recv_tokens} rows x topk {topk} -> ~{estimated / 1e9:.1f} GB > "
                 f"budget {mem_budget / 1e9:.1f} GB (aic_moe_ep_mem_fraction={_MEM_FRACTION})"
             )
-        hidden_states = torch.randn(num_recv_tokens, padded_hidden, dtype=torch.bfloat16, device=device)
+        hidden_states = torch.randn(max_recv_tokens, padded_hidden, dtype=torch.bfloat16, device=device)
         # Xe3P serving quantizes in prepare (before dispatch), so outside the timed region.
         act_hidden_states, a1q_scale = quant_fp8_block_act(hidden_states)
-        output = torch.empty_like(hidden_states)
         del hidden_states
+        outputs = [
+            torch.empty(topk_ids.shape[0], padded_hidden, dtype=torch.bfloat16, device=device) for topk_ids, _ in draws
+        ]
 
         def kernel_func():
-            fused_moe_impl.apply(
-                output=output,
-                hidden_states=act_hidden_states,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                a1q_scale=a1q_scale,
-            )
+            for (topk_ids, topk_weights), output in zip(draws, outputs, strict=True):
+                num_recv_tokens = topk_ids.shape[0]
+                fused_moe_impl.apply(
+                    output=output,
+                    hidden_states=act_hidden_states[:num_recv_tokens],
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    a1q_scale=a1q_scale[:num_recv_tokens],
+                )
 
         with benchmark_with_power(
             device=device,
             kernel_func=kernel_func,
-            num_warmups=3,
-            num_runs=10,
+            num_warmups=num_warmups,
+            num_runs=num_runs,
             repeat_n=1,
             use_cuda_graph=xpu_graph_measure_enabled(),
             allow_graph_fail=False,  # graph mandatory when enabled; capture failure fails the case
         ) as results:
             pass
-        return results["latency_ms"], results["power_stats"]
+        return results["latency_ms"] / num_draws, results["power_stats"]
 
     return bench
 
