@@ -384,24 +384,12 @@ common_case_values:
       power_law_alpha: 0.0
     - name: power_law
       power_law_alpha: 1.2
-    xpu_models:
-    - model_path: deepseek-ai/DeepSeek-V4-Flash
-      hidden_size: 4096
-      inter_size: 2048
-      topk: 6
-      num_experts: 256
-    - model_path: deepseek-ai/DeepSeek-V4-Pro
-      hidden_size: 7168
-      inter_size: 3072
-      topk: 6
-      num_experts: 384
-    - model_path: zai-org/GLM-5.3
-      hidden_size: 6144
-      inter_size: 2048
-      topk: 8
-      num_experts: 256
-    - model_path: deepseek-ai/DeepSeek-V4.1-Flash
-      hidden_size: 5120
-      inter_size: 2304
-      topk: 6
-      num_experts: 384
+    # Model allowlist only: dimensions come from each model's moe_vllm_xpu_cri
+    # declaration in cases/models (framework_cases.vllm_xpu_cri or
+    # framework_specific_model_case_values.vllm_xpu_cri). Aliases match, e.g.
+    # GLM-5.3 resolves to the zai-org/GLM-5.2 row.
+    model_paths:
+    - deepseek-ai/DeepSeek-V4-Flash
+    - deepseek-ai/DeepSeek-V4-Pro
+    - zai-org/GLM-5.3
+    - deepseek-ai/DeepSeek-V4.1-Flash

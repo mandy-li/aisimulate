@@ -13,10 +13,11 @@ XPU port of ``collector/wideep/vllm/collect_moe_ep.py`` (WideEP
 Rows land in the unified ``moe_expert_compute_perf`` table with the CUDA
 collector's exact payload (``_build_moe_ep_row``) and ``kernel_source`` label,
 imported rather than re-declared so the two backends cannot drift. The sweep
-(models, EP sizes, per-phase token counts, distributions) is declared in
-``cases/base_ops/moe.yaml`` under ``common_case_values.moe_ep``; its token
-counts are GLOBAL (the persisted ``num_tokens`` key, = per-rank * ep) and are
-benchmarked as-is.
+(model allowlist, EP sizes, per-phase token counts, distributions) is declared
+in ``cases/base_ops/moe.yaml`` under ``common_case_values.moe_ep``; model
+dimensions come from the models' ``vllm_xpu_cri`` MoE rows. Token counts are
+GLOBAL (the persisted ``num_tokens`` key, = per-rank * ep) and are benchmarked
+as-is.
 
 Differences from the CUDA bench, all mirroring vLLM's DeepEP high-throughput
 serving path into ``XPUExperts`` (``fused_moe/experts/xpu_moe.py``):
