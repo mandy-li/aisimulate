@@ -36,6 +36,7 @@ class FakeAdapter:
         self.verified = []
         self.benched = []
         self.closed = False
+        self.closed_failed = None
 
     def prepare(self, cases):
         self.prepared = list(cases)
@@ -57,8 +58,9 @@ class FakeAdapter:
             capacity=case.capacity,
         )
 
-    def close(self):
+    def close(self, *, failed=False):
         self.closed = True
+        self.closed_failed = failed
 
 
 def _plan(world_size=2, max_tokens=4096, shapes=(SHAPE,)):
@@ -226,6 +228,16 @@ def test_watchdog_disarms_after_a_fast_case(monkeypatch):
         pass
 
 
+def test_check_device_bdfs():
+    a2a.check_device_bdfs(["0000:05:00.0", "0000:09:00.0"], ["0000:09:00.0", "0000:05:00.0"])
+    with pytest.raises(VllmMoeA2ADeclarationError, match="do not match"):
+        a2a.check_device_bdfs(["0000:05:00.0", "0000:09:00.0"], ["0000:05:00.0", "0000:8a:00.0"])
+    with pytest.raises(VllmMoeA2ADeclarationError, match="share a device"):
+        a2a.check_device_bdfs(["0000:05:00.0", "0000:05:00.0"], ["0000:05:00.0"])
+    with pytest.raises(VllmMoeA2ADeclarationError, match="resolve"):
+        a2a.check_device_bdfs(["0000:05:00.0", ""], ["0000:05:00.0", "0000:09:00.0"])
+
+
 # ---------------------------------------------------------------------------
 # Collection loop
 # ---------------------------------------------------------------------------
@@ -236,6 +248,7 @@ def test_collect_writes_two_rows_per_case():
     adapter = FakeAdapter()
     result = a2a.collect_with_adapter(cases, adapter=adapter, world_size=2, node_num=1, agreement=_agree)
     assert adapter.prepared == cases and adapter.closed
+    assert adapter.closed_failed is False
     assert adapter.verified == adapter.benched == [16, 512, 4096]
     assert len(result.rows) == 2 * len(cases)
     assert {row["phase"] for row in result.rows} == {"dispatch", "combine"}
@@ -247,7 +260,20 @@ def test_collect_writes_two_rows_per_case():
 def test_collect_stops_at_first_verify_failure():
     cases, _ = _plan()
     adapter = FakeAdapter(fail_verify={512})
-    result = a2a.collect_with_adapter(cases, adapter=adapter, world_size=2, node_num=1, agreement=_agree)
+    recorded, logged = [], []
+    result = a2a.collect_with_adapter(
+        cases,
+        adapter=adapter,
+        world_size=2,
+        node_num=1,
+        agreement=_agree,
+        on_failure=recorded.append,
+        log=logged.append,
+    )
+    assert [failure.case.num_tokens for failure in recorded] == [512]  # persisted before teardown
+    assert adapter.closed_failed is True
+    assert any("start case 1" in line for line in logged)
+    assert any("FAILED case 1" in line for line in logged)
     assert adapter.benched == [16]
     assert [failure.case.num_tokens for failure in result.failures] == [512]
     assert result.failures[0].error_type == "VerificationError"
@@ -349,10 +375,19 @@ def test_plan_only_needs_no_gpu(monkeypatch, capsys):
     assert len(summary["skipped_shapes"]) == 1
 
 
-def test_measured_run_requires_guard_bdfs(monkeypatch):
+def test_guard_bdfs_requires_debug_mode(monkeypatch):
     monkeypatch.setattr(a2a, "get_vllm_moe_a2a_shapes", lambda **_: [SHAPE])
     monkeypatch.setattr(a2a, "get_moe_a2a_workload_grid", lambda: GRID)
     monkeypatch.delenv("AIC_A2A_GUARD_BDFS", raising=False)
     monkeypatch.setenv("WORLD_SIZE", "2")
-    with pytest.raises(VllmMoeA2ADeclarationError, match="--guard-bdfs"):
+    with pytest.raises(VllmMoeA2ADeclarationError, match="add --debug"):
+        a2a.main(["--gpus-per-node", "2", "--guard-bdfs", BDF])
+    monkeypatch.setenv("AIC_A2A_GUARD_BDFS", BDF)
+    with pytest.raises(VllmMoeA2ADeclarationError, match="add --debug"):
         a2a.main(["--gpus-per-node", "2"])
+
+
+def test_debug_flag_parses():
+    args = a2a.parse_args(["--gpus-per-node", "2", "--debug", "--guard-bdfs", BDF])
+    assert args.debug and args.guard_bdfs == BDF
+    assert not a2a.parse_args(["--gpus-per-node", "2"]).debug

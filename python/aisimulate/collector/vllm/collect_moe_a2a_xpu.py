@@ -7,8 +7,10 @@ XPU port of ``collector/wideep/vllm/collect_moe_a2a.py`` for single-node CRI
 hosts without RDMA NICs. Launch one rank per local XPU with torchrun::
 
     ZE_AFFINITY_MASK=0,1 torchrun --standalone --nproc-per-node 2 \\
-        collector/vllm/collect_moe_a2a_xpu.py --gpus-per-node 2 \\
-        --guard-bdfs 0000:05:00.0,0000:8a:00.0 --output-path <dir>
+        collector/vllm/collect_moe_a2a_xpu.py --gpus-per-node 2 --output-path <dir>
+
+Add ``--debug [--guard-bdfs 0000:05:00.0,0000:09:00.0]`` while investigating
+device failures (see "Debug mode" below).
 
 Rows land in the unified ``moe_a2a_perf`` table with the CUDA collector's
 row builder and key (``_build_moe_a2a_row``), so the two backends cannot
@@ -40,8 +42,6 @@ host's GPU offline:
 * Every case runs an int32 correctness round with the same bytes per row
   before timing. DeepSymm's spin-waits give up silently after 1e6 polls, so
   a broken run can otherwise exit cleanly with plausible timings.
-* The kernel log is checked for new xe error/fault/reset/wedge/timeout lines
-  on ``--guard-bdfs`` around every case.
 * A per-case watchdog ends the process (SIGTERM, letting DeepSymm drain its
   queues, then a hard exit) instead of letting a hang continue.
 * The first failure stops the whole run on every rank; later cases are not
@@ -49,6 +49,17 @@ host's GPU offline:
 * The DeepEP buffer is sized from ``Config.get_pcie_buffer_size_hint``
   (DeepSymm does not bounds-check intranode buffers) and destroyed explicitly
   after a barrier.
+* A failed case is written to the rank's error file before teardown, and
+  teardown after a failure does not touch the (possibly lost) device.
+
+Debug mode (``--debug``), for diagnosing device hangs and faults:
+
+* Rank 0 prints a timestamped, flushed line when each case starts, finishes
+  or fails, so a crash or hang always names the case.
+* With ``--guard-bdfs`` (comma-separated PCI BDFs of this run's cards, or
+  ``AIC_A2A_GUARD_BDFS``): each rank's device BDF must match the list, and the
+  kernel log is checked for new xe error/fault/reset/wedge/timeout lines on
+  those cards around buffer setup and every case. Needs a readable ``dmesg``.
 """
 
 from __future__ import annotations
@@ -68,7 +79,7 @@ import threading
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -333,6 +344,26 @@ def parse_bdfs(raw: str | None) -> list[str]:
     return values
 
 
+def local_device_bdf(device_index: int) -> str:
+    """PCI address of visible XPU ``device_index`` (after ZE_AFFINITY_MASK), via DeepSymm's SYCL query."""
+    from deep_symm.tools.topology import device_bdf_from_sycl
+
+    return str(device_bdf_from_sycl(device_index)).lower()
+
+
+def check_device_bdfs(rank_bdfs: list[Any], guard_bdfs: list[str]) -> None:
+    """The ranks' devices must be exactly the guarded cards, or the guard watches the wrong log lines."""
+    observed = [str(bdf or "").lower() for bdf in rank_bdfs]
+    if any(not bdf for bdf in observed):
+        raise VllmMoeA2ADeclarationError(f"could not resolve every rank's device BDF: {observed}")
+    if len(set(observed)) != len(observed):
+        raise VllmMoeA2ADeclarationError(f"ranks share a device: {observed}")
+    if set(observed) != set(guard_bdfs):
+        raise VllmMoeA2ADeclarationError(
+            f"rank devices {observed} do not match --guard-bdfs {sorted(guard_bdfs)}; check ZE_AFFINITY_MASK"
+        )
+
+
 class CaseWatchdog:
     """End the process if one case runs past its deadline.
 
@@ -386,8 +417,14 @@ def collect_with_adapter(
     agreement: StageAgreement,
     guard: DriverFaultGuard | None = None,
     watchdog: CaseWatchdog | None = None,
+    on_failure: Callable[[CaseFailure], None] | None = None,
+    log: Callable[[str], None] | None = None,
 ) -> XpuCollectionResult:
-    """Verify then time each case; stop every rank at the first failure."""
+    """Verify then time each case; stop every rank at the first failure.
+
+    ``on_failure`` persists a failed case before teardown, so a teardown error
+    on a lost device cannot hide which case failed.
+    """
     result = XpuCollectionResult([], [], [])
     prepare_error: BaseException | None = None
     try:
@@ -405,6 +442,8 @@ def collect_with_adapter(
         local_error: BaseException | None = None
         shape = case.shape
         label = f"case {case_index} ({shape.hidden_size}/{shape.topk}/{shape.num_experts}, {case.num_tokens} tok)"
+        if log is not None:
+            log(f"[{case_index + 1}/{len(cases)}] start {label}")
         try:
             baseline = guard.snapshot() if guard is not None else 0
             arm = watchdog.arm(label) if watchdog is not None else _null_context()
@@ -421,14 +460,21 @@ def collect_with_adapter(
         )
         if outcome.failed:
             assert outcome.error is not None
-            result.failures.append(CaseFailure(case, type(outcome.error).__name__, str(outcome.error)))
+            failure = CaseFailure(case, type(outcome.error).__name__, str(outcome.error))
+            result.failures.append(failure)
             result.not_run = cases[case_index + 1 :]
+            if log is not None:
+                log(f"[{case_index + 1}/{len(cases)}] FAILED {label}: {failure.error_type}: {failure.error}")
+            if on_failure is not None:
+                on_failure(failure)
             break
+        if log is not None:
+            log(f"[{case_index + 1}/{len(cases)}] done {label}")
         result.resolved_cases.append(case)
         result.rows.extend(case_rows)
     close_error: BaseException | None = None
     try:
-        adapter.close()
+        adapter.close(failed=bool(result.failures))
     except BaseException as error:
         close_error = error
     raise_for_stage(
@@ -582,8 +628,14 @@ class XpuDeepEPDirectAdapter:
             "num_pcie_bytes": str(self.pcie_bytes),
         }
 
-    def close(self) -> None:
+    def close(self, *, failed: bool = False) -> None:
         if self._buffer is None:
+            return
+        if failed:
+            # After a failed case the device may be lost: any synchronize or
+            # destroy would raise again and mask the original error. The
+            # process exits non-zero right after, which releases the buffer.
+            self._buffer = None
             return
         import torch
         import torch.distributed as dist
@@ -849,12 +901,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gpus-per-node", type=int, required=True)
     parser.add_argument("--output-path", default=os.getcwd())
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
+    parser.add_argument("--debug", action="store_true", help="per-case progress lines; enables --guard-bdfs")
     parser.add_argument(
         "--guard-bdfs",
         default=os.environ.get("AIC_A2A_GUARD_BDFS", ""),
         help="comma-separated PCI BDFs of this run's cards; their new kernel-log errors stop the run",
     )
-    parser.add_argument("--no-driver-guard", action="store_true", help="skip the kernel-log guard (diagnostic only)")
     parser.add_argument("--case-timeout", type=float, default=DEFAULT_CASE_TIMEOUT_S)
     parser.add_argument("--warmups", type=int, default=5)
     parser.add_argument("--runs", type=int, default=20)
@@ -905,19 +957,16 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     bdfs = parse_bdfs(args.guard_bdfs)
-    if not bdfs and not args.no_driver_guard:
-        raise VllmMoeA2ADeclarationError(
-            "measured runs need --guard-bdfs (or AIC_A2A_GUARD_BDFS) with this run's card BDFs; "
-            "pass --no-driver-guard only for diagnostics"
-        )
-    guard = DriverFaultGuard(bdfs) if bdfs and not args.no_driver_guard else None
+    if bdfs and not args.debug:
+        raise VllmMoeA2ADeclarationError("--guard-bdfs (or AIC_A2A_GUARD_BDFS) is a debug-mode option; add --debug")
+    guard = DriverFaultGuard(bdfs) if bdfs else None
     if guard is not None:
         try:
             guard.snapshot()
         except (OSError, subprocess.CalledProcessError) as error:
             raise VllmMoeA2ADeclarationError(
                 f"--guard-bdfs needs a readable kernel log (`dmesg` failed: {error}); "
-                "pass --no-driver-guard only for diagnostics"
+                "drop --guard-bdfs to run without it"
             ) from error
 
     # Runtime indices must follow BDF order so ZE_AFFINITY_MASK matches --guard-bdfs.
@@ -941,6 +990,11 @@ def main(argv: list[str] | None = None) -> None:
     group = dist.new_group(ranks, backend="xccl")
     cpu_group = dist.new_group(ranks, backend="gloo")
     output_dir = Path(args.output_path)
+    if guard is not None:
+        local_bdf = local_device_bdf(identity.local_rank)
+        bdf_list: list[Any] = [None] * identity.world_size
+        dist.all_gather_object(bdf_list, local_bdf, group=cpu_group)
+        check_device_bdfs(bdf_list, bdfs)
     print(
         f"[vllm-xpu moe_a2a] host={socket.gethostname()} rank={identity.rank}/{identity.world_size} "
         f"cases={len(cases)} dev_only={dev_only}",
@@ -951,6 +1005,10 @@ def main(argv: list[str] | None = None) -> None:
         failure = torch.tensor([int(failed)], device="cpu", dtype=torch.int64)
         dist.all_reduce(failure, op=dist.ReduceOp.MAX, group=cpu_group)
         return bool(failure.item())
+
+    def log_progress(message: str) -> None:
+        if identity.rank == 0:
+            print(f"[vllm-xpu moe_a2a] {datetime.now():%H:%M:%S} {message}", flush=True)
 
     def record_watchdog(message: str) -> None:
         _append_rank_error(output_dir, identity, _stage_record(identity, "watchdog", "Timeout", message))
@@ -976,9 +1034,9 @@ def main(argv: list[str] | None = None) -> None:
             agreement=agree,
             guard=guard,
             watchdog=CaseWatchdog(args.case_timeout, on_expire=record_watchdog),
+            on_failure=lambda failure: _append_rank_error(output_dir, identity, _failure_record(failure, identity)),
+            log=log_progress if args.debug else None,
         )
-        for failure in result.failures:
-            _append_rank_error(output_dir, identity, _failure_record(failure, identity))
         (output_dir / STATS_FILENAME_TEMPLATE.format(rank=identity.rank)).write_text(
             json.dumps([stat.__dict__ for stat in adapter.stats], indent=2)
         )
